@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::PermissionsExt,
     path::Path,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
@@ -22,11 +23,26 @@ pub struct StateStore {
 impl StateStore {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
+            let existed = parent.exists();
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create state directory {}", parent.display()))?;
+            if existed {
+                let mode = std::fs::metadata(parent)?.permissions().mode();
+                if mode & 0o077 != 0 {
+                    bail!("state directory must not be accessible by group or other users");
+                }
+            } else {
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("secure state directory {}", parent.display()))?;
+            }
+        }
+        if path.is_symlink() {
+            bail!("state database must not be a symbolic link");
         }
         let connection = Connection::open(path)
             .with_context(|| format!("open state database {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure state database {}", path.display()))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -177,35 +193,52 @@ fn now_epoch() -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 
     use super::StateStore;
 
     fn temporary_db(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "pi-matrix-transport-{name}-{}.sqlite",
-            std::process::id()
-        ))
+        std::env::temp_dir()
+            .join(format!("pi-matrix-transport-{name}-{}", std::process::id()))
+            .join("state.sqlite")
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir_all(parent);
+        }
     }
 
     #[test]
     fn deduplicates_and_orders_inbound_events() {
         let path = temporary_db("dedup");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
         let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert!(store.enqueue("$z-first", "first").unwrap());
         assert!(!store.enqueue("$z-first", "duplicate").unwrap());
         assert!(store.enqueue("$a-second", "second").unwrap());
         assert_eq!(store.claim().unwrap().unwrap().event_id, "$z-first");
         assert_eq!(store.claim().unwrap().unwrap().event_id, "$a-second");
         assert!(store.claim().unwrap().is_none());
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
     fn releases_and_completes_idempotently() {
         let path = temporary_db("complete");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
         let store = StateStore::open(&path).unwrap();
         store.enqueue("$one", "first").unwrap();
         store.claim().unwrap();
@@ -217,13 +250,13 @@ mod tests {
             Some("$out")
         );
         assert_eq!(store.counts().unwrap(), (0, 0, 1));
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 
     #[test]
     fn startup_requeues_claimed_event() {
         let path = temporary_db("restart");
-        let _ = std::fs::remove_file(&path);
+        cleanup(&path);
         {
             let store = StateStore::open(&path).unwrap();
             store.enqueue("$one", "first").unwrap();
@@ -231,6 +264,6 @@ mod tests {
         }
         let reopened = StateStore::open(&path).unwrap();
         assert_eq!(reopened.claim().unwrap().unwrap().event_id, "$one");
-        let _ = std::fs::remove_file(path);
+        cleanup(&path);
     }
 }

@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
     let access_token = read_secret(&config.access_token_file).await?;
     let store_passphrase = read_secret(&config.store_passphrase_file).await?;
     let state = StateStore::open(&config.state_db)?;
+    secure_directory(&config.store_path).await?;
 
     let client = Client::builder()
         .homeserver_url(&config.homeserver)
@@ -65,17 +66,6 @@ async fn main() -> Result<()> {
         })
         .await?;
 
-    let response = client.sync_once(SyncSettings::default()).await?;
-    let room = client
-        .get_room(&config.room_id)
-        .context("configured canary room is unavailable")?;
-    if room.state() != RoomState::Joined {
-        bail!("configured canary room is not joined");
-    }
-    if !room.latest_encryption_state().await?.is_encrypted() {
-        bail!("configured canary room is not encrypted");
-    }
-
     let app = Arc::new(App {
         config,
         state,
@@ -88,6 +78,19 @@ async fn main() -> Result<()> {
             async move { accept_inbound(app, event, room, client).await }
         }
     });
+
+    // Register the handler before the initial sync so events received while the
+    // sidecar was offline are durably queued instead of skipped by next_batch.
+    let response = client.sync_once(SyncSettings::default()).await?;
+    let room = client
+        .get_room(&app.config.room_id)
+        .context("configured canary room is unavailable")?;
+    if room.state() != RoomState::Joined {
+        bail!("configured canary room is not joined");
+    }
+    if !room.latest_encryption_state().await?.is_encrypted() {
+        bail!("configured canary room is not encrypted");
+    }
 
     let listener = bind_socket(&app.config).await?;
     tracing::info!("XO Matrix sidecar ready");
@@ -104,7 +107,29 @@ async fn main() -> Result<()> {
     }
 }
 
+async fn secure_directory(path: &std::path::Path) -> Result<()> {
+    let existed = tokio::fs::try_exists(path).await?;
+    tokio::fs::create_dir_all(path).await?;
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_dir() {
+        bail!("private runtime path is not a directory");
+    }
+    if existed && metadata.permissions().mode() & 0o077 != 0 {
+        bail!("private runtime directory must not be accessible by group or other users");
+    }
+    if !existed {
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    Ok(())
+}
+
 async fn read_secret(path: &std::path::Path) -> Result<String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .with_context(|| format!("inspect secret file {}", path.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        bail!("secret file must be a user-only regular file");
+    }
     let value = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("read secret file {}", path.display()))?;
