@@ -37,6 +37,7 @@ struct App {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_env_filter("pi_matrix_transport_sidecar=info")
         .with_target(false)
         .with_level(true)
         .compact()
