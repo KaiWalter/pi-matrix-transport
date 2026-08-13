@@ -27,7 +27,9 @@ The normal XO Matrix user ID and device ID may be declarative non-secret configu
 
 ## Default-off wiring
 
-Any future Nix service definition must have `MATRIX_XO_ENABLED=0` unless an explicit activation change sets it to `1`. XO settings must likewise omit the extension until activation approval; preparing a service package does not authorize loading it into XO.
+The inactive Home Manager module is prepared at `~/nix-config/features/pi-agent/matrix-xo-canary.nix` and imported only by `kai-lenovo`. Its option `services.piMatrixTransportXoCanary.enable` is explicitly `false`; therefore it emits no systemd unit and installs no extension. Activation also requires an explicit package built from the canonical source checkpoint and a SOPS-materialized environment file.
+
+XO settings must omit the extension until activation approval. Preparing or building the module does not authorize enabling its service, installing the extension into an XO agent directory, or loading it into XO.
 
 ## Activation sequence
 
