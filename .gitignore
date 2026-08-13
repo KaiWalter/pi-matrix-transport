@@ -1,0 +1,9 @@
+/target/
+/sidecar/target/
+/extension/node_modules/
+*.sock
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+secrets/
