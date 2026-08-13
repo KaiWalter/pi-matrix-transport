@@ -27,9 +27,9 @@ The normal XO Matrix user ID and device ID may be declarative non-secret configu
 
 ## Default-off wiring
 
-The inactive Home Manager module is prepared at `~/nix-config/features/pi-agent/matrix-xo-canary.nix` and imported only by `kai-lenovo`. Its option `services.piMatrixTransportXoCanary.enable` is explicitly `false`; therefore it emits no systemd unit and installs no extension. Activation also requires an explicit package built from the canonical source checkpoint and a SOPS-materialized environment file.
+The Home Manager module lives at `~/nix-config/features/pi-agent/matrix-xo-canary.nix` and is imported only by `kai-lenovo`. After explicit operator approval, `services.piMatrixTransportXoCanary.enable` was set to `true` with a package pinned to this GitHub source. It starts the sidecar and stages the extension outside agent directories.
 
-XO settings must omit the extension until activation approval. Preparing or building the module does not authorize enabling its service, installing the extension into an XO agent directory, or loading it into XO.
+The XO Telegram launcher is the only Pi startup surface that sets `PI_MATRIX_XO_ENABLED=1` and loads the staged extension. The source remains default-OFF and all other agents remain unwired.
 
 ## Activation sequence
 
