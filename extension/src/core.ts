@@ -52,7 +52,7 @@ export class MatrixTransportController {
       }
       this.active = { event: response.event };
       try {
-        this.deps.inject(buildPrompt(response.event.body));
+        this.deps.inject(buildPrompt(response.event.body, response.event.kind));
         this.deps.log("info", "Injected one Matrix canary turn into XO");
       } catch {
         await this.releaseActive();
@@ -122,8 +122,10 @@ export class MatrixTransportController {
   }
 }
 
-export function buildPrompt(body: string): string {
-  return `[matrix]\n${body.trim()}`;
+export function buildPrompt(body: string, kind: InboundEvent["kind"] = "text"): string {
+  return kind === "voice"
+    ? `[matrix voice]\n${body.trim()}`
+    : `[matrix]\n${body.trim()}`;
 }
 
 export function extractFinalAssistantText(messages: unknown[]): string | undefined {
@@ -154,5 +156,6 @@ function validInbound(event: InboundEvent): boolean {
     && event.event_id.length > 0
     && typeof event.body === "string"
     && event.body.trim().length > 0
+    && (event.kind === "text" || event.kind === "voice")
     && [...event.body].length <= 16_000;
 }

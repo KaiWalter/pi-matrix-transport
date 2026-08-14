@@ -15,8 +15,9 @@ test("activation is exact and default off", () => {
   assert.equal(loadConfig({ PI_MATRIX_XO_ENABLED: "1" }).enabled, true);
 });
 
-test("prompt preserves only the transport marker and body", () => {
+test("prompt identifies text and voice without extra metadata", () => {
   assert.equal(buildPrompt("  hello XO  "), "[matrix]\nhello XO");
+  assert.equal(buildPrompt("  spoken request  ", "voice"), "[matrix voice]\nspoken request");
 });
 
 test("extracts the last assistant text parts", () => {
@@ -35,7 +36,7 @@ test("claims once, injects once, and sends after settled", async () => {
   const ipc = async (request: IpcRequest): Promise<IpcResponse> => {
     calls.push(request);
     if (request.op === "claim") {
-      return { ok: true, event: { event_id: "$one", body: "hello" } };
+      return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
     }
     return { ok: true, status: "sent", matrix_event_id: "$reply" };
   };
@@ -64,7 +65,9 @@ test("session shutdown releases an unanswered claim", async () => {
   const controller = new MatrixTransportController({
     ipc: async (request) => {
       calls.push(request);
-      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello" } };
+      if (request.op === "claim") {
+        return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
+      }
       return { ok: true, status: "released" };
     },
     isIdle: () => true,
@@ -83,7 +86,9 @@ test("failed send stays queued and retries with the same idempotency key", async
   let sendAttempts = 0;
   const controller = new MatrixTransportController({
     ipc: async (request) => {
-      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello" } };
+      if (request.op === "claim") {
+        return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
+      }
       if (request.op === "send") {
         sends.push(request);
         sendAttempts += 1;

@@ -13,6 +13,7 @@ use serde::Serialize;
 pub struct InboundEvent {
     pub event_id: String,
     pub body: String,
+    pub kind: String,
 }
 
 #[derive(Debug)]
@@ -62,6 +63,18 @@ impl StateStore {
                sent_at INTEGER NOT NULL
              );",
         )?;
+        let has_kind = connection
+            .prepare("PRAGMA table_info(inbound)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "kind");
+        if !has_kind {
+            connection.execute(
+                "ALTER TABLE inbound ADD COLUMN kind TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text','voice'))",
+                [],
+            )?;
+        }
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -69,13 +82,13 @@ impl StateStore {
         Ok(store)
     }
 
-    pub fn enqueue(&self, event_id: &str, body: &str) -> Result<bool> {
-        if event_id.is_empty() || body.trim().is_empty() {
-            bail!("event id and body must be non-empty");
+    pub fn enqueue(&self, event_id: &str, body: &str, kind: &str) -> Result<bool> {
+        if event_id.is_empty() || body.trim().is_empty() || !matches!(kind, "text" | "voice") {
+            bail!("event id, body, and kind must be valid");
         }
         let changed = self.connection.lock().expect("state database mutex poisoned").execute(
-            "INSERT OR IGNORE INTO inbound(event_id, body, state, received_at) VALUES (?1, ?2, 'queued', ?3)",
-            params![event_id, body, now_epoch()?],
+            "INSERT OR IGNORE INTO inbound(event_id, body, kind, state, received_at) VALUES (?1, ?2, ?3, 'queued', ?4)",
+            params![event_id, body, kind, now_epoch()?],
         )?;
         Ok(changed == 1)
     }
@@ -93,12 +106,13 @@ impl StateStore {
         )?;
         let event = transaction
             .query_row(
-                "SELECT event_id, body FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
+                "SELECT event_id, body, kind FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
                 [],
                 |row| {
                     Ok(InboundEvent {
                         event_id: row.get(0)?,
                         body: row.get(1)?,
+                        kind: row.get(2)?,
                     })
                 },
             )
@@ -119,6 +133,33 @@ impl StateStore {
             [event_id],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn contains_event(&self, event_id: &str) -> Result<bool> {
+        Ok(self
+            .connection
+            .lock()
+            .expect("state database mutex poisoned")
+            .query_row(
+                "SELECT 1 FROM inbound WHERE event_id=?1",
+                [event_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn inbound_kind(&self, event_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .lock()
+            .expect("state database mutex poisoned")
+            .query_row(
+                "SELECT kind FROM inbound WHERE event_id=?1",
+                [event_id],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn outbound_event(&self, idempotency_key: &str) -> Result<Option<String>> {
@@ -226,11 +267,17 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert!(store.enqueue("$z-first", "first").unwrap());
-        assert!(!store.enqueue("$z-first", "duplicate").unwrap());
-        assert!(store.enqueue("$a-second", "second").unwrap());
-        assert_eq!(store.claim().unwrap().unwrap().event_id, "$z-first");
-        assert_eq!(store.claim().unwrap().unwrap().event_id, "$a-second");
+        assert!(store.enqueue("$z-first", "first", "text").unwrap());
+        assert!(!store.enqueue("$z-first", "duplicate", "text").unwrap());
+        assert!(store.contains_event("$z-first").unwrap());
+        assert!(!store.contains_event("$missing").unwrap());
+        assert!(store.enqueue("$a-second", "second", "voice").unwrap());
+        let first = store.claim().unwrap().unwrap();
+        assert_eq!(first.event_id, "$z-first");
+        assert_eq!(first.kind, "text");
+        let second = store.claim().unwrap().unwrap();
+        assert_eq!(second.event_id, "$a-second");
+        assert_eq!(second.kind, "voice");
         assert!(store.claim().unwrap().is_none());
         cleanup(&path);
     }
@@ -240,7 +287,7 @@ mod tests {
         let path = temporary_db("complete");
         cleanup(&path);
         let store = StateStore::open(&path).unwrap();
-        store.enqueue("$one", "first").unwrap();
+        store.enqueue("$one", "first", "text").unwrap();
         store.claim().unwrap();
         assert!(store.release("$one").unwrap());
         store.claim().unwrap();
@@ -259,7 +306,7 @@ mod tests {
         cleanup(&path);
         {
             let store = StateStore::open(&path).unwrap();
-            store.enqueue("$one", "first").unwrap();
+            store.enqueue("$one", "first", "voice").unwrap();
             store.claim().unwrap();
         }
         let reopened = StateStore::open(&path).unwrap();

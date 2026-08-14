@@ -3,6 +3,7 @@ import net from "node:net";
 export type InboundEvent = {
   event_id: string;
   body: string;
+  kind: "text" | "voice";
 };
 
 export type IpcResponse = {
