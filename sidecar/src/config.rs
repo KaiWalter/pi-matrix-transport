@@ -16,6 +16,7 @@ pub struct Config {
     pub media_temp_path: PathBuf,
     pub transcribe_command: PathBuf,
     pub tts_command: PathBuf,
+    pub tts_voice: String,
     pub room_id: OwnedRoomId,
     pub sender_id: OwnedUserId,
 }
@@ -50,6 +51,7 @@ impl Config {
             media_temp_path,
             transcribe_command: required_executable("MATRIX_XO_TRANSCRIBE_COMMAND")?,
             tts_command: required_executable("MATRIX_XO_TTS_COMMAND")?,
+            tts_voice: required("MATRIX_XO_TTS_VOICE")?,
             room_id: required("MATRIX_XO_ROOM_ID")?
                 .try_into()
                 .context("invalid MATRIX_XO_ROOM_ID")?,

@@ -35,6 +35,7 @@ Sidecar activation requires `MATRIX_XO_ENABLED=1` plus:
 - `MATRIX_XO_MEDIA_TEMP_PATH`
 - `MATRIX_XO_TRANSCRIBE_COMMAND`
 - `MATRIX_XO_TTS_COMMAND`
+- `MATRIX_XO_TTS_VOICE` (Matrix-only Edge TTS voice, currently `en-GB-SoniaNeural`)
 - `MATRIX_XO_ROOM_ID`
 - `MATRIX_XO_SENDER_ID`
 

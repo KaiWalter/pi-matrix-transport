@@ -343,6 +343,7 @@ async fn send_audio_reply(
     let mut child = Command::new(&app.config.tts_command)
         .args(["--stdin", "--out"])
         .arg(&path)
+        .args(["--voice", &app.config.tts_voice])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
