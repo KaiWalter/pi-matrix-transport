@@ -161,15 +161,23 @@ async fn enforce_device_trust(client: &Client, config: &Config) -> Result<()> {
         if !config.allow_cross_signing_repair {
             bail!("Matrix device trust is incomplete; restore the crypto store or explicitly authorize cross-signing repair");
         }
-        // This is an explicitly deployment-authorized recovery operation. It
-        // re-uploads a locally-held identity and signs this device; if local
-        // identity material is absent, the homeserver's UIAA policy controls
-        // whether new keys may be created.
-        client
-            .encryption()
-            .bootstrap_cross_signing(None)
-            .await
-            .context("perform explicitly authorized Matrix cross-signing repair")?;
+        if cross_signing.is_complete() {
+            // The identity already exists locally; sign only this device. This
+            // deliberately avoids re-uploading device/one-time keys.
+            own_device
+                .verify()
+                .await
+                .context("self-sign the configured Matrix device")?;
+        } else {
+            // This is an explicitly deployment-authorized recovery operation.
+            // If local identity material is absent, the homeserver's UIAA policy
+            // controls whether new keys may be created.
+            client
+                .encryption()
+                .bootstrap_cross_signing(None)
+                .await
+                .context("perform explicitly authorized Matrix cross-signing repair")?;
+        }
     }
 
     let cross_signing = client
