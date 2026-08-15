@@ -20,6 +20,7 @@ pub struct Config {
     pub room_id: OwnedRoomId,
     pub sender_id: OwnedUserId,
     pub require_verified_device: bool,
+    pub allow_cross_signing_repair: bool,
 }
 
 impl Config {
@@ -60,6 +61,8 @@ impl Config {
                 .try_into()
                 .context("invalid MATRIX_XO_SENDER_ID")?,
             require_verified_device: env::var("MATRIX_XO_REQUIRE_VERIFIED_DEVICE").as_deref()
+                == Ok("1"),
+            allow_cross_signing_repair: env::var("MATRIX_XO_ALLOW_CROSS_SIGNING_REPAIR").as_deref()
                 == Ok("1"),
         })
     }

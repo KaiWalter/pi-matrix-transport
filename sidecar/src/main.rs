@@ -150,18 +150,41 @@ async fn enforce_device_trust(client: &Client, config: &Config) -> Result<()> {
         .cross_signing_status()
         .await
         .context("Matrix encryption is unavailable after session restoration")?;
-    if !cross_signing.is_complete() {
-        bail!("Matrix cross-signing private keys are incomplete; restore the encrypted crypto store instead of resetting identity");
-    }
-
     let own_device = client
         .encryption()
         .get_own_device()
         .await
         .context("load configured Matrix device")?
         .context("configured Matrix device was not returned by key query")?;
-    if !own_device.is_verified_with_cross_signing() {
-        bail!("configured Matrix device is not self-cross-signed; refusing unverified encrypted transport");
+
+    if !cross_signing.is_complete() || !own_device.is_verified_with_cross_signing() {
+        if !config.allow_cross_signing_repair {
+            bail!("Matrix device trust is incomplete; restore the crypto store or explicitly authorize cross-signing repair");
+        }
+        // This is an explicitly deployment-authorized recovery operation. It
+        // re-uploads a locally-held identity and signs this device; if local
+        // identity material is absent, the homeserver's UIAA policy controls
+        // whether new keys may be created.
+        client
+            .encryption()
+            .bootstrap_cross_signing(None)
+            .await
+            .context("perform explicitly authorized Matrix cross-signing repair")?;
+    }
+
+    let cross_signing = client
+        .encryption()
+        .cross_signing_status()
+        .await
+        .context("recheck Matrix cross-signing status")?;
+    let own_device = client
+        .encryption()
+        .get_own_device()
+        .await
+        .context("recheck configured Matrix device")?
+        .context("configured Matrix device disappeared after trust repair")?;
+    if !cross_signing.is_complete() || !own_device.is_verified_with_cross_signing() {
+        bail!("Matrix device-trust repair did not produce a complete self-cross-signed device");
     }
 
     tracing::info!(
