@@ -46,6 +46,157 @@ fn rich_text_reply(body: &str) -> RoomMessageEventContent {
     RoomMessageEventContent::text_markdown(body.trim())
 }
 
+/// Produces a plain, speakable rendering of Markdown for the TTS boundary.
+/// It deliberately retains human-readable content (including link labels and
+/// code) while removing presentation-only Markdown syntax and link targets.
+fn speech_text(body: &str) -> String {
+    let mut in_fenced_code = false;
+    let mut lines = Vec::new();
+
+    for raw_line in body.replace('\r', "").lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fenced_code = !in_fenced_code;
+            continue;
+        }
+        if !in_fenced_code && is_horizontal_rule(trimmed) {
+            continue;
+        }
+
+        let line = if in_fenced_code {
+            trimmed
+        } else {
+            strip_block_markers(trimmed)
+        };
+        let spoken = strip_inline_markdown(line);
+        if !spoken.is_empty() {
+            lines.push(spoken);
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let markers = line
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    markers.len() >= 3
+        && markers
+            .chars()
+            .all(|character| matches!(character, '-' | '*' | '_'))
+}
+
+fn strip_block_markers(line: &str) -> &str {
+    let without_quote = line.strip_prefix('>').map(str::trim_start).unwrap_or(line);
+    let without_heading = without_quote.trim_start_matches('#').trim_start();
+    let without_bullet = without_heading
+        .strip_prefix("- ")
+        .or_else(|| without_heading.strip_prefix("* "))
+        .or_else(|| without_heading.strip_prefix("+ "))
+        .unwrap_or(without_heading);
+
+    let ordered_prefix_len = without_bullet
+        .char_indices()
+        .take_while(|(_, character)| character.is_ascii_digit())
+        .last()
+        .and_then(|(index, _)| {
+            without_bullet[index + 1..]
+                .strip_prefix(". ")
+                .or_else(|| without_bullet[index + 1..].strip_prefix(") "))
+                .map(|_| index + 3)
+        });
+    ordered_prefix_len
+        .and_then(|index| without_bullet.get(index..))
+        .unwrap_or(without_bullet)
+}
+
+fn strip_inline_markdown(line: &str) -> String {
+    let characters = line.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+
+    while index < characters.len() {
+        if characters[index] == '\\' && index + 1 < characters.len() {
+            output.push(characters[index + 1]);
+            index += 2;
+            continue;
+        }
+        if characters[index] == '`'
+            || characters[index] == '*'
+            || characters[index] == '_'
+            || characters[index] == '~'
+        {
+            index += 1;
+            continue;
+        }
+        if characters[index] == '['
+            || (characters[index] == '!' && characters.get(index + 1) == Some(&'['))
+        {
+            let label_start = if characters[index] == '!' {
+                index + 2
+            } else {
+                index + 1
+            };
+            if let Some(label_end) = characters[label_start..]
+                .iter()
+                .position(|character| *character == ']')
+            {
+                let label_end = label_start + label_end;
+                if characters.get(label_end + 1) == Some(&'(') {
+                    if let Some(destination_end) = matching_paren(&characters, label_end + 1) {
+                        output.push_str(&strip_inline_markdown(
+                            &characters[label_start..label_end]
+                                .iter()
+                                .collect::<String>(),
+                        ));
+                        index = destination_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        if characters[index] == '<' {
+            if let Some(end) = characters[index + 1..]
+                .iter()
+                .position(|character| *character == '>')
+            {
+                let end = index + 1 + end;
+                let candidate = characters[index + 1..end].iter().collect::<String>();
+                if candidate.starts_with("http://")
+                    || candidate.starts_with("https://")
+                    || candidate.starts_with("mailto:")
+                {
+                    index = end + 1;
+                    continue;
+                }
+            }
+        }
+        output.push(characters[index]);
+        index += 1;
+    }
+
+    output.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn matching_paren(characters: &[char], open_index: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (index, character) in characters.iter().enumerate().skip(open_index) {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 struct App {
     config: Config,
     state: StateStore,
@@ -419,6 +570,10 @@ async fn send_audio_reply(
     body: &str,
     transaction_id: OwnedTransactionId,
 ) -> Result<matrix_sdk::ruma::api::client::message::send_message_event::v3::Response> {
+    let speech = speech_text(body);
+    if speech.is_empty() {
+        bail!("Matrix reply has no speakable content");
+    }
     let temp_directory = private_temp_directory(&app.config.media_temp_path)?;
     let path = temp_directory.path().join("outbound.mp3");
     let mut child = Command::new(&app.config.tts_command)
@@ -434,7 +589,7 @@ async fn send_audio_reply(
         .stdin
         .take()
         .context("TTS stdin unavailable")?
-        .write_all(body.as_bytes())
+        .write_all(speech.as_bytes())
         .await?;
     let status = timeout(TTS_TIMEOUT, child.wait())
         .await
@@ -577,7 +732,7 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 
 #[cfg(test)]
 mod tests {
-    use super::{deterministic_transaction_id, rich_text_reply};
+    use super::{deterministic_transaction_id, rich_text_reply, speech_text};
 
     #[test]
     fn transaction_id_is_stable_and_opaque() {
@@ -585,6 +740,23 @@ mod tests {
         let second = deterministic_transaction_id("reply:$private-event");
         assert_eq!(first, second);
         assert!(!first.as_str().contains("private"));
+    }
+
+    #[test]
+    fn speech_text_removes_markdown_syntax_and_link_targets() {
+        let source = "# Status\n\n- **ready** — see [the guide](https://example.test/guide).\n- `cargo test`\n> _No_ raw URL: <https://example.test>.\n\n![diagram](https://example.test/diagram.png)";
+        assert_eq!(
+            speech_text(source),
+            "Status\nready — see the guide.\ncargo test\nNo raw URL: .\ndiagram",
+        );
+    }
+
+    #[test]
+    fn speech_text_preserves_plain_text_and_strips_fenced_code_markers() {
+        assert_eq!(
+            speech_text("1. First item\n2. Second item\n\n```text\nlet value = 1;\n```"),
+            "First item\nSecond item\nlet value = 1;",
+        );
     }
 
     #[test]
