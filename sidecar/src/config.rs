@@ -19,6 +19,7 @@ pub struct Config {
     pub tts_voice: String,
     pub room_id: OwnedRoomId,
     pub sender_id: OwnedUserId,
+    pub require_verified_device: bool,
 }
 
 impl Config {
@@ -58,6 +59,8 @@ impl Config {
             sender_id: required("MATRIX_XO_SENDER_ID")?
                 .try_into()
                 .context("invalid MATRIX_XO_SENDER_ID")?,
+            require_verified_device: env::var("MATRIX_XO_REQUIRE_VERIFIED_DEVICE").as_deref()
+                == Ok("1"),
         })
     }
 }

@@ -86,6 +86,7 @@ async fn main() -> Result<()> {
             },
         })
         .await?;
+    enforce_device_trust(&client, &config).await?;
 
     let app = Arc::new(App {
         config,
@@ -126,6 +127,49 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn enforce_device_trust(client: &Client, config: &Config) -> Result<()> {
+    if !config.require_verified_device {
+        tracing::warn!("Matrix device-trust enforcement is disabled");
+        return Ok(());
+    }
+
+    // This creates and signs a cross-signing identity only for a new account.
+    // If the server already has an identity, the SDK leaves it intact; a missing
+    // local private identity is therefore a recovery failure, not a reason to
+    // rotate the account's remote cross-signing keys automatically.
+    client
+        .encryption()
+        .bootstrap_cross_signing_if_needed(None)
+        .await
+        .context("bootstrap Matrix cross-signing identity when absent")?;
+
+    let cross_signing = client
+        .encryption()
+        .cross_signing_status()
+        .await
+        .context("Matrix encryption is unavailable after session restoration")?;
+    if !cross_signing.is_complete() {
+        bail!("Matrix cross-signing private keys are incomplete; restore the encrypted crypto store instead of resetting identity");
+    }
+
+    let own_device = client
+        .encryption()
+        .get_own_device()
+        .await
+        .context("load configured Matrix device")?
+        .context("configured Matrix device was not returned by key query")?;
+    if !own_device.is_verified_with_cross_signing() {
+        bail!("configured Matrix device is not self-cross-signed; refusing unverified encrypted transport");
+    }
+
+    tracing::info!(
+        cross_signing_complete = true,
+        current_device_verified = true,
+        "Matrix device-trust gate passed"
+    );
+    Ok(())
 }
 
 async fn secure_directory(path: &std::path::Path) -> Result<()> {
