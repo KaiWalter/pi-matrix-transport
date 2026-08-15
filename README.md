@@ -5,7 +5,7 @@ Default-OFF transport for the XO-only Matrix Phase 2 canary.
 ## Components
 
 - `sidecar/`: Rust `matrix-sdk` process that owns the normal MAS Matrix session, encrypted SQLite crypto store, exact room/sender allowlists, durable event deduplication, encrypted media download/decryption, local Whisper transcription, and encrypted text/audio sends.
-- `extension/`: dependency-free Pi extension that polls the sidecar over a mode-0600 Unix socket, injects one Matrix text or transcribed voice turn into XO, waits for `agent_settled`, and returns exactly one final answer. Voice-origin turns receive an MP3 audio attachment; TTS failure falls back to encrypted text.
+- `extension/`: dependency-free Pi extension that polls the sidecar over a mode-0600 Unix socket, injects one Matrix text or transcribed voice turn into XO, waits for `agent_settled`, and returns exactly one final answer. Text replies retain a plain-text fallback and include Matrix-safe HTML rendered from Markdown. Voice-origin turns receive an MP3 audio attachment; TTS failure falls back to the same encrypted rich-text reply.
 
 Both components require explicit enable flags and fail closed. Deployment wiring lives separately in `nix-config`; the current bounded canary enables only the XO sidecar and XO Telegram extension. No other Pi lane is authorized or wired.
 

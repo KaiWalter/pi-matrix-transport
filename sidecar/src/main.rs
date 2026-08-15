@@ -40,6 +40,12 @@ const MAX_TRANSCRIPT_BYTES: u64 = 65_536;
 const VOICE_PROCESSING_ERROR_MESSAGE: &str =
     "I could not transcribe this Matrix voice message. Please ask Kai to resend it.";
 
+/// Builds a Matrix `m.text` event with the original text as the interoperable
+/// fallback and Matrix-safe HTML generated from Markdown for capable clients.
+fn rich_text_reply(body: &str) -> RoomMessageEventContent {
+    RoomMessageEventContent::text_markdown(body.trim())
+}
+
 struct App {
     config: Config,
     state: StateStore,
@@ -471,13 +477,13 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
                     Ok(sent) => sent,
                     Err(_) => {
                         tracing::warn!("audio reply failed; using encrypted text fallback");
-                        room.send(RoomMessageEventContent::text_plain(body.trim()))
+                        room.send(rich_text_reply(&body))
                             .with_transaction_id(transaction_id)
                             .await?
                     }
                 }
             } else {
-                room.send(RoomMessageEventContent::text_plain(body.trim()))
+                room.send(rich_text_reply(&body))
                     .with_transaction_id(transaction_id)
                     .await?
             };
@@ -496,7 +502,7 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 
 #[cfg(test)]
 mod tests {
-    use super::deterministic_transaction_id;
+    use super::{deterministic_transaction_id, rich_text_reply};
 
     #[test]
     fn transaction_id_is_stable_and_opaque() {
@@ -504,5 +510,21 @@ mod tests {
         let second = deterministic_transaction_id("reply:$private-event");
         assert_eq!(first, second);
         assert!(!first.as_str().contains("private"));
+    }
+
+    #[test]
+    fn rich_text_reply_preserves_plain_fallback_and_adds_matrix_html() {
+        let body = "# Status\n\n- **ready**\n- [details](https://example.test)";
+        let content = rich_text_reply(body);
+        let value = serde_json::to_value(content).expect("message content serializes");
+
+        assert_eq!(value["body"], body);
+        assert_eq!(value["format"], "org.matrix.custom.html");
+        let formatted = value["formatted_body"]
+            .as_str()
+            .expect("Markdown produces Matrix HTML");
+        assert!(formatted.contains("<h1>Status</h1>"));
+        assert!(formatted.contains("<strong>ready</strong>"));
+        assert!(formatted.contains("<a href=\"https://example.test\">details</a>"));
     }
 }
