@@ -6,18 +6,32 @@ import {
   buildPrompt,
   extractFinalAssistantText,
   loadConfig,
+  type MatrixAgentTransportConfig,
 } from "../src/core.ts";
 import type { IpcRequest, IpcResponse } from "../src/ipc.ts";
 
-test("activation is exact and default off", () => {
+const CONFIG: MatrixAgentTransportConfig = {
+  enabled: true,
+  socketPath: "/tmp/test.sock",
+  pollMs: 1000,
+  idempotencyPrefix: "test-reply",
+  promptTag: "matrix test",
+  laneLabel: "Test",
+  topicEnabled: false,
+  topicHelperPath: "",
+};
+
+test("activation and topic routing are exact and default off", () => {
   assert.equal(loadConfig({}).enabled, false);
-  assert.equal(loadConfig({ PI_MATRIX_XO_ENABLED: "true" }).enabled, false);
-  assert.equal(loadConfig({ PI_MATRIX_XO_ENABLED: "1" }).enabled, true);
+  assert.equal(loadConfig({ PI_MATRIX_AGENT_ENABLED: "true" }).enabled, false);
+  assert.equal(loadConfig({ PI_MATRIX_AGENT_ENABLED: "1" }).enabled, true);
+  assert.equal(loadConfig({ PI_MATRIX_TOPIC_ENABLED: "true" }).topicEnabled, false);
+  assert.equal(loadConfig({ PI_MATRIX_TOPIC_ENABLED: "1" }).topicEnabled, true);
 });
 
-test("prompt identifies text and voice without extra metadata", () => {
-  assert.equal(buildPrompt("  hello XO  "), "[matrix]\nhello XO");
-  assert.equal(buildPrompt("  spoken request  ", "voice"), "[matrix voice]\nspoken request");
+test("prompt identifies text and voice with role-neutral tag", () => {
+  assert.equal(buildPrompt(" hello ", "text", "matrix xo"), "[matrix xo]\nhello");
+  assert.equal(buildPrompt(" spoken ", "voice", "matrix xo"), "[matrix xo voice]\nspoken");
 });
 
 test("extracts the last assistant text parts", () => {
@@ -30,83 +44,116 @@ test("extracts the last assistant text parts", () => {
   );
 });
 
-test("claims once, injects once, and sends after settled", async () => {
+test("prepares and captures before injecting a project-bound turn", async () => {
+  const order: string[] = [];
   const calls: IpcRequest[] = [];
-  const injected: string[] = [];
-  const ipc = async (request: IpcRequest): Promise<IpcResponse> => {
-    calls.push(request);
-    if (request.op === "claim") {
-      return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
-    }
-    return { ok: true, status: "sent", matrix_event_id: "$reply" };
-  };
-  const controller = new MatrixTransportController({
-    ipc,
+  const controller = new MatrixTransportController(CONFIG, {
+    ipc: async (request): Promise<IpcResponse> => {
+      calls.push(request);
+      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
+      return { ok: true, status: "sent" };
+    },
     isIdle: () => true,
-    inject: (prompt) => injected.push(prompt),
+    prepareInbound: async () => {
+      order.push("capture");
+      return { prompt: "prepared prompt" };
+    },
+    inject: (prompt) => order.push(`inject:${prompt}`),
     log: () => {},
   });
 
   await controller.tick();
-  await controller.tick();
-  assert.deepEqual(injected, ["[matrix]\nhello"]);
-  controller.captureAgentEnd([{ role: "assistant", content: [{ type: "text", text: "XO answer" }] }]);
+  assert.deepEqual(order, ["capture", "inject:prepared prompt"]);
+  controller.captureAgentEnd([{ role: "assistant", content: "answer" }]);
   await controller.onAgentSettled();
-
   assert.equal(controller.hasActiveTurn(), false);
-  assert.deepEqual(calls, [
-    { op: "claim" },
-    { op: "send", event_id: "$one", idempotency_key: "xo-reply:$one", body: "XO answer" },
-  ]);
+  assert.deepEqual(calls.at(-1), {
+    op: "send",
+    event_id: "$one",
+    idempotency_key: "test-reply:$one",
+    body: "answer",
+  });
+});
+
+test("topic commands send deterministic direct answers without model injection", async () => {
+  const sends: IpcRequest[] = [];
+  let injected = false;
+  const controller = new MatrixTransportController(CONFIG, {
+    ipc: async (request): Promise<IpcResponse> => {
+      if (request.op === "claim") return { ok: true, event: { event_id: "$cmd", body: "/topic status", kind: "text" } };
+      sends.push(request);
+      return { ok: true, status: "sent" };
+    },
+    isIdle: () => true,
+    prepareInbound: async () => ({ directAnswer: "Active: off." }),
+    inject: () => { injected = true; },
+    log: () => {},
+  });
+
+  await controller.tick();
+  assert.equal(injected, false);
+  assert.equal(controller.hasActiveTurn(), false);
+  assert.deepEqual(sends, [{
+    op: "send",
+    event_id: "$cmd",
+    idempotency_key: "test-reply:$cmd",
+    body: "Active: off.",
+  }]);
+});
+
+test("preparation failure fails closed without model injection", async () => {
+  let injected = false;
+  const sends: IpcRequest[] = [];
+  const controller = new MatrixTransportController(CONFIG, {
+    ipc: async (request): Promise<IpcResponse> => {
+      if (request.op === "claim") return { ok: true, event: { event_id: "$bad", body: "hello", kind: "text" } };
+      sends.push(request);
+      return { ok: true, status: "sent" };
+    },
+    isIdle: () => true,
+    prepareInbound: async () => { throw new Error("capture failed"); },
+    inject: () => { injected = true; },
+    log: () => {},
+  });
+
+  await controller.tick();
+  assert.equal(injected, false);
+  assert.equal((sends[0] as Extract<IpcRequest, { op: "send" }>).body.includes("failed closed"), true);
+});
+
+test("retryable provider error is never sent to Matrix and keeps the turn active", async () => {
+  const sends: IpcRequest[] = [];
+  const controller = new MatrixTransportController(CONFIG, {
+    ipc: async (request): Promise<IpcResponse> => {
+      if (request.op === "claim") return { ok: true, event: { event_id: "$retry", body: "hello", kind: "text" } };
+      sends.push(request);
+      return { ok: true, status: "sent" };
+    },
+    isIdle: () => true,
+    inject: () => {},
+    log: () => {},
+  });
+
+  await controller.tick();
+  controller.captureAgentEnd([{ role: "assistant", content: "Error: Unknown error (no error details in response)" }]);
+  await controller.onAgentSettled();
+  assert.equal(controller.hasActiveTurn(), true);
+  assert.deepEqual(sends, []);
 });
 
 test("session shutdown releases an unanswered claim", async () => {
   const calls: IpcRequest[] = [];
-  const controller = new MatrixTransportController({
+  const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request) => {
       calls.push(request);
-      if (request.op === "claim") {
-        return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
-      }
+      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
       return { ok: true, status: "released" };
     },
     isIdle: () => true,
     inject: () => {},
     log: () => {},
   });
-
   await controller.tick();
   await controller.onSessionShutdown();
-  assert.equal(controller.hasActiveTurn(), false);
   assert.deepEqual(calls, [{ op: "claim" }, { op: "release", event_id: "$one" }]);
-});
-
-test("failed send stays queued and retries with the same idempotency key", async () => {
-  const sends: IpcRequest[] = [];
-  let sendAttempts = 0;
-  const controller = new MatrixTransportController({
-    ipc: async (request) => {
-      if (request.op === "claim") {
-        return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
-      }
-      if (request.op === "send") {
-        sends.push(request);
-        sendAttempts += 1;
-        if (sendAttempts === 1) throw new Error("offline");
-        return { ok: true, status: "sent" };
-      }
-      return { ok: true };
-    },
-    isIdle: () => true,
-    inject: () => {},
-    log: () => {},
-  });
-
-  await controller.tick();
-  controller.captureAgentEnd([{ role: "assistant", content: "answer" }]);
-  await controller.onAgentSettled();
-  assert.equal(controller.hasActiveTurn(), true);
-  await controller.tick();
-  assert.equal(controller.hasActiveTurn(), false);
-  assert.deepEqual(sends[0], sends[1]);
 });

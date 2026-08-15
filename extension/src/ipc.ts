@@ -1,20 +1,20 @@
 import net from "node:net";
 
-export type InboundEvent = {
+export type MatrixInboundEvent = {
   event_id: string;
   body: string;
   kind: "text" | "voice";
 };
 
-export type IpcResponse = {
+export type MatrixIpcResponse = {
   ok: boolean;
   status?: string;
-  event?: InboundEvent;
+  event?: MatrixInboundEvent;
   error?: string;
   matrix_event_id?: string;
 };
 
-export type IpcRequest =
+export type MatrixIpcRequest =
   | { op: "status" }
   | { op: "claim" }
   | { op: "release"; event_id: string }
@@ -22,16 +22,16 @@ export type IpcRequest =
 
 export async function request(
   socketPath: string,
-  payload: IpcRequest,
-  timeoutMs = 5_000,
-): Promise<IpcResponse> {
-  return await new Promise<IpcResponse>((resolve, reject) => {
+  payload: MatrixIpcRequest,
+  timeoutMs = 5000,
+): Promise<MatrixIpcResponse> {
+  return await new Promise<MatrixIpcResponse>((resolve, reject) => {
     const socket = net.createConnection({ path: socketPath });
     let settled = false;
     let data = "";
     const timer = setTimeout(() => finish(new Error("Matrix sidecar IPC timeout")), timeoutMs);
 
-    function finish(error?: Error, response?: IpcResponse): void {
+    function finish(error?: Error, response?: MatrixIpcResponse): void {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -44,11 +44,11 @@ export async function request(
     socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
     socket.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 65_536) finish(new Error("Matrix sidecar IPC response too large"));
+      if (data.length > 65536) finish(new Error("Matrix sidecar IPC response too large"));
     });
     socket.on("end", () => {
       try {
-        const response = JSON.parse(data.trim()) as IpcResponse;
+        const response = JSON.parse(data.trim()) as MatrixIpcResponse;
         if (!response || typeof response.ok !== "boolean") {
           finish(new Error("Invalid Matrix sidecar IPC response"));
           return;
