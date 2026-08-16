@@ -14,7 +14,10 @@ export type MatrixAgentTransportConfig = {
 export type PreparedInbound = {
   prompt?: string;
   directAnswer?: string;
+  afterSend?: () => Promise<void> | void;
 };
+
+export type MatrixSlashCommand = "reload" | "new" | "eco" | "balanced" | "power";
 
 export type MatrixTransportDeps = {
   ipc: (request: MatrixIpcRequest) => Promise<MatrixIpcResponse>;
@@ -28,12 +31,17 @@ type ActiveTurn = {
   event: MatrixInboundEvent;
   answer?: string;
   prompt?: string;
+  afterSend?: () => Promise<void> | void;
   modelRetryPending?: boolean;
   modelRetryCount?: number;
   modelNextRetryAt?: number;
+  activityStartedAt: number;
+  activityStatusEventId?: string;
+  activityLongRunning?: boolean;
 };
 
 const RETRYABLE_LLM_ERROR = "Error: Unknown error (no error details in response)";
+const LONG_RUNNING_ACTIVITY_MS = 5000;
 
 export function loadConfig(env: NodeJS.ProcessEnv): MatrixAgentTransportConfig {
   const enabled = env.PI_MATRIX_AGENT_ENABLED === "1";
@@ -79,11 +87,12 @@ export class MatrixTransportController {
         await this.flushAnswer();
         return;
       }
-      if (this.active?.modelRetryPending) {
-        await this.retryModelTurnIfReady();
+      if (this.active) {
+        await this.refreshActivity(this.active);
+        if (this.active.modelRetryPending) await this.retryModelTurnIfReady();
         return;
       }
-      if (this.active || !this.safeIsIdle()) return;
+      if (!this.safeIsIdle()) return;
       const response = await this.deps.ipc({ op: "claim" });
       this.markSidecarAvailable();
       if (!response.ok || !response.event) return;
@@ -91,13 +100,15 @@ export class MatrixTransportController {
         this.deps.log("warn", `${this.config.laneLabel}: sidecar returned an invalid claimed event`);
         return;
       }
-      this.active = { event: response.event };
+      this.active = { event: response.event, activityStartedAt: Date.now() };
+      await this.startActivity(this.active);
       try {
         const prepared = this.deps.prepareInbound
           ? await this.deps.prepareInbound(response.event)
           : { prompt: buildPrompt(response.event.body, response.event.kind, this.config.promptTag) };
         if (prepared.directAnswer?.trim()) {
           this.active.answer = prepared.directAnswer.trim();
+          this.active.afterSend = prepared.afterSend;
           await this.flushAnswer();
           return;
         }
@@ -169,9 +180,18 @@ export class MatrixTransportController {
         const reason = response.error?.trim() || response.status?.trim() || "send rejected";
         throw new Error(reason);
       }
+      await this.stopActivity(active, "done");
+      const afterSend = active.afterSend;
       this.active = undefined;
       this.markAnswerRetryRecovered();
       this.deps.log("info", `${this.config.laneLabel}: delivered one Matrix answer`);
+      if (afterSend) {
+        try {
+          await afterSend();
+        } catch {
+          this.deps.log("warn", `${this.config.laneLabel}: post-send action failed`);
+        }
+      }
     } catch (error) {
       this.noteAnswerRetryPending(error);
       this.answerNextAttemptAt = Date.now() + this.computeRetryDelayMs();
@@ -179,14 +199,62 @@ export class MatrixTransportController {
   }
 
   private async releaseActive(): Promise<void> {
-    const eventId = this.active?.event.event_id;
+    const active = this.active;
     this.active = undefined;
     this.resetAnswerRetryState();
-    if (!eventId) return;
+    if (!active) return;
+    await this.stopActivity(active, "stopped");
     try {
-      await this.deps.ipc({ op: "release", event_id: eventId });
+      await this.deps.ipc({ op: "release", event_id: active.event.event_id });
     } catch {
       // sidecar requeues claimed rows at restart
+    }
+  }
+
+  private async startActivity(active: ActiveTurn): Promise<void> {
+    try {
+      const response = await this.deps.ipc({
+        op: "activity_start",
+        event_id: active.event.event_id,
+      });
+      if (response.ok && response.matrix_event_id) {
+        active.activityStatusEventId = response.matrix_event_id;
+      }
+    } catch {
+      this.deps.log("warn", `${this.config.laneLabel}: Matrix activity start unavailable`);
+    }
+  }
+
+  private async refreshActivity(active: ActiveTurn): Promise<void> {
+    if (!active.activityStatusEventId) {
+      await this.startActivity(active);
+      return;
+    }
+    const longRunning = !active.activityLongRunning
+      && Date.now() - active.activityStartedAt >= LONG_RUNNING_ACTIVITY_MS;
+    try {
+      const response = await this.deps.ipc({
+        op: "activity_heartbeat",
+        event_id: active.event.event_id,
+        status_event_id: active.activityStatusEventId,
+        long_running: longRunning,
+      });
+      if (response.ok && longRunning) active.activityLongRunning = true;
+    } catch {
+      this.deps.log("warn", `${this.config.laneLabel}: Matrix activity heartbeat unavailable`);
+    }
+  }
+
+  private async stopActivity(active: ActiveTurn, outcome: "done" | "stopped"): Promise<void> {
+    try {
+      await this.deps.ipc({
+        op: "activity_stop",
+        event_id: active.event.event_id,
+        status_event_id: active.activityStatusEventId,
+        outcome,
+      });
+    } catch {
+      // Typing expires at the homeserver and progress is best-effort.
     }
   }
 
@@ -274,6 +342,54 @@ export class MatrixTransportController {
     const exponentialDelayMs = 5000 * 2 ** Math.min(6, this.answerRetryCount - 1);
     return Math.min(300000, exponentialDelayMs);
   }
+}
+
+const MATRIX_SLASH_COMMANDS = new Set<MatrixSlashCommand>([
+  "reload",
+  "new",
+  "eco",
+  "balanced",
+  "power",
+]);
+
+const MATRIX_SLASH_COMMAND_RE = /^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/;
+
+function normalizeSlashBody(raw: string): string {
+  let value = raw
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+    .trim();
+
+  const htmlParagraph = value.match(/^<p>([\s\S]*)<\/p>$/i);
+  if (htmlParagraph) value = htmlParagraph[1]?.trim() ?? "";
+
+  if (value.startsWith("`") && value.endsWith("`") && value.length >= 2) {
+    value = value.slice(1, -1).trim();
+  }
+
+  return value;
+}
+
+export function parseMatrixSlashCommand(
+  body: string,
+  kind: MatrixInboundEvent["kind"] = "text",
+): MatrixSlashCommand | undefined {
+  if (kind !== "text") return undefined;
+  const trimmed = normalizeSlashBody(body);
+  if (!trimmed) return undefined;
+
+  const bare = trimmed.toLowerCase();
+  if ((bare === "new" || bare === "reload" || bare === "eco" || bare === "balanced" || bare === "power")
+    && MATRIX_SLASH_COMMANDS.has(bare as MatrixSlashCommand)) {
+    return bare as MatrixSlashCommand;
+  }
+
+  const match = trimmed.match(MATRIX_SLASH_COMMAND_RE);
+  if (!match) return undefined;
+  const command = match[1]?.toLowerCase();
+  if (!command || !MATRIX_SLASH_COMMANDS.has(command as MatrixSlashCommand)) return undefined;
+  const remainder = trimmed.slice(match[0].length).trim();
+  if (remainder.length > 0) return undefined;
+  return command as MatrixSlashCommand;
 }
 
 function modelRetryDelayMs(retryCount: number): number {

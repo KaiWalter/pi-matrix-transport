@@ -11,16 +11,17 @@ use matrix_sdk::{
     authentication::{matrix::MatrixSession, SessionTokens},
     config::SyncSettings,
     media::{MediaFormat, MediaRequestParameters},
+    room::edit::EditedContent,
     ruma::{
         events::room::message::{
             AudioMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-            RoomMessageEventContent,
+            RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
         },
-        OwnedTransactionId,
+        OwnedEventId, OwnedTransactionId,
     },
     Client, Room, RoomState, SessionMeta,
 };
-use protocol::{Request, Response};
+use protocol::{ActivityOutcome, Request, Response};
 use sha2::{Digest, Sha256};
 use store::StateStore;
 use tokio::{
@@ -666,6 +667,54 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             Ok(Response::status(queued, claimed, completed))
         }
         Request::Claim => Ok(Response::claim(app.state.claim()?)),
+        Request::ActivityStart { event_id } => {
+            ensure_source_event(app, &event_id)?;
+            let room = activity_room(app).await?;
+            room.typing_notice(true).await?;
+            let sent = room
+                .send(RoomMessageEventContent::notice_plain("Processing…"))
+                .with_transaction_id(deterministic_transaction_id(&format!(
+                    "activity-start:{event_id}"
+                )))
+                .await?;
+            Ok(Response::done(
+                "activity_started",
+                Some(sent.event_id.to_string()),
+            ))
+        }
+        Request::ActivityHeartbeat {
+            event_id,
+            status_event_id,
+            long_running,
+        } => {
+            ensure_source_event(app, &event_id)?;
+            let room = activity_room(app).await?;
+            room.typing_notice(true).await?;
+            if long_running {
+                if let Some(status_event_id) = status_event_id {
+                    edit_activity_notice(&room, &status_event_id, "Still working…", "working")
+                        .await?;
+                }
+            }
+            Ok(Response::done("activity_refreshed", None))
+        }
+        Request::ActivityStop {
+            event_id,
+            status_event_id,
+            outcome,
+        } => {
+            ensure_source_event(app, &event_id)?;
+            let room = activity_room(app).await?;
+            room.typing_notice(false).await?;
+            if let Some(status_event_id) = status_event_id {
+                let (body, phase) = match outcome {
+                    ActivityOutcome::Done => ("Done.", "done"),
+                    ActivityOutcome::Stopped => ("Stopped.", "stopped"),
+                };
+                edit_activity_notice(&room, &status_event_id, body, phase).await?;
+            }
+            Ok(Response::done("activity_stopped", None))
+        }
         Request::Release { event_id } => Ok(Response::done(
             if app.state.release(&event_id)? {
                 "released"
@@ -723,6 +772,45 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             Ok(Response::done("sent", Some(matrix_event_id)))
         }
     }
+}
+
+fn ensure_source_event(app: &App, event_id: &str) -> Result<()> {
+    app.state
+        .inbound_kind(event_id)?
+        .context("source event unavailable")?;
+    Ok(())
+}
+
+async fn activity_room(app: &App) -> Result<Room> {
+    let room = app
+        .client
+        .get_room(&app.config.room_id)
+        .context("canary room unavailable")?;
+    if room.state() != RoomState::Joined || !room.latest_encryption_state().await?.is_encrypted() {
+        bail!("canary room is not joined and encrypted");
+    }
+    Ok(room)
+}
+
+async fn edit_activity_notice(
+    room: &Room,
+    status_event_id: &str,
+    body: &str,
+    phase: &str,
+) -> Result<()> {
+    let event_id = OwnedEventId::try_from(status_event_id).context("invalid activity event id")?;
+    let edit = room
+        .make_edit_event(
+            &event_id,
+            EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::notice_plain(body)),
+        )
+        .await?;
+    room.send(edit)
+        .with_transaction_id(deterministic_transaction_id(&format!(
+            "activity-edit:{status_event_id}:{phase}"
+        )))
+        .await?;
+    Ok(())
 }
 
 fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {

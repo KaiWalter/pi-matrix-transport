@@ -17,6 +17,9 @@ export type MatrixIpcResponse = {
 export type MatrixIpcRequest =
   | { op: "status" }
   | { op: "claim" }
+  | { op: "activity_start"; event_id: string }
+  | { op: "activity_heartbeat"; event_id: string; status_event_id?: string; long_running: boolean }
+  | { op: "activity_stop"; event_id: string; status_event_id?: string; outcome: "done" | "stopped" }
   | { op: "release"; event_id: string }
   | { op: "send"; event_id: string; idempotency_key: string; body: string };
 
