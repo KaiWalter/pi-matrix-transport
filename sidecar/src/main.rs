@@ -39,7 +39,7 @@ const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TTS_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_TRANSCRIPT_BYTES: u64 = 65_536;
 const VOICE_PROCESSING_ERROR_MESSAGE: &str =
-    "I could not transcribe this Matrix voice message. Please ask Kai to resend it.";
+    "I could not transcribe this Matrix voice message. Please resend it.";
 
 /// Builds a Matrix `m.text` event with the original text as the interoperable
 /// fallback and Matrix-safe HTML generated from Markdown for capable clients.
@@ -258,16 +258,16 @@ async fn main() -> Result<()> {
     let response = client.sync_once(SyncSettings::default()).await?;
     let room = client
         .get_room(&app.config.room_id)
-        .context("configured canary room is unavailable")?;
+        .context("configured room is unavailable")?;
     if room.state() != RoomState::Joined {
-        bail!("configured canary room is not joined");
+        bail!("configured room is not joined");
     }
     if !room.latest_encryption_state().await?.is_encrypted() {
-        bail!("configured canary room is not encrypted");
+        bail!("configured room is not encrypted");
     }
 
     let listener = bind_socket(&app.config).await?;
-    tracing::info!("XO Matrix sidecar ready");
+    tracing::info!("Matrix transport sidecar ready");
 
     let sync = client.sync(SyncSettings::default().token(response.next_batch));
     tokio::pin!(sync);
@@ -605,7 +605,7 @@ async fn send_audio_reply(
     let content_type: mime::Mime = "audio/mpeg".parse()?;
     Ok(room
         .send_attachment(
-            "xo-reply.mp3",
+            "matrix-reply.mp3",
             &content_type,
             data,
             AttachmentConfig::new().txn_id(transaction_id),
@@ -740,11 +740,11 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             let room = app
                 .client
                 .get_room(&app.config.room_id)
-                .context("canary room unavailable")?;
+                .context("configured room unavailable")?;
             if room.state() != RoomState::Joined
                 || !room.latest_encryption_state().await?.is_encrypted()
             {
-                bail!("canary room is not joined and encrypted");
+                bail!("configured room is not joined and encrypted");
             }
             let transaction_id = deterministic_transaction_id(&idempotency_key);
             let kind = app
@@ -785,9 +785,9 @@ async fn activity_room(app: &App) -> Result<Room> {
     let room = app
         .client
         .get_room(&app.config.room_id)
-        .context("canary room unavailable")?;
+        .context("configured room unavailable")?;
     if room.state() != RoomState::Joined || !room.latest_encryption_state().await?.is_encrypted() {
-        bail!("canary room is not joined and encrypted");
+        bail!("configured room is not joined and encrypted");
     }
     Ok(room)
 }
@@ -815,7 +815,7 @@ async fn edit_activity_notice(
 
 fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
     let digest = Sha256::digest(idempotency_key.as_bytes());
-    OwnedTransactionId::from(format!("xo_{digest:x}"))
+    OwnedTransactionId::from(format!("matrix_{digest:x}"))
 }
 
 #[cfg(test)]

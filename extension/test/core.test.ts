@@ -6,7 +6,6 @@ import {
   buildPrompt,
   extractFinalAssistantText,
   loadConfig,
-  parseMatrixSlashCommand,
   type MatrixAgentTransportConfig,
 } from "../src/core.ts";
 import type { MatrixIpcRequest, MatrixIpcResponse } from "../src/ipc.ts";
@@ -18,30 +17,24 @@ const CONFIG: MatrixAgentTransportConfig = {
   idempotencyPrefix: "test-reply",
   promptTag: "matrix test",
   laneLabel: "Test",
-  topicEnabled: false,
-  topicHelperPath: "",
 };
 
-test("activation and topic routing are exact and default off", () => {
+test("activation is exact and default off", () => {
   assert.equal(loadConfig({}).enabled, false);
   assert.equal(loadConfig({ PI_MATRIX_AGENT_ENABLED: "true" }).enabled, false);
-  assert.equal(loadConfig({ PI_MATRIX_AGENT_ENABLED: "1" }).enabled, true);
-  assert.equal(loadConfig({ PI_MATRIX_TOPIC_ENABLED: "true" }).topicEnabled, false);
-  assert.equal(loadConfig({ PI_MATRIX_TOPIC_ENABLED: "1" }).topicEnabled, true);
+  assert.throws(
+    () => loadConfig({ PI_MATRIX_AGENT_ENABLED: "1" }),
+    /PI_MATRIX_AGENT_SOCKET is required/,
+  );
+  assert.equal(loadConfig({
+    PI_MATRIX_AGENT_ENABLED: "1",
+    PI_MATRIX_AGENT_SOCKET: "/private/runtime/pi-matrix-agent.sock",
+  }).enabled, true);
 });
 
-test("prompt identifies text and voice with role-neutral tag", () => {
-  assert.equal(buildPrompt(" hello ", "text", "matrix xo"), "[matrix xo]\nhello");
-  assert.equal(buildPrompt(" spoken ", "voice", "matrix xo"), "[matrix xo voice]\nspoken");
-});
-
-test("parses supported Matrix slash commands", () => {
-  assert.equal(parseMatrixSlashCommand("/reload"), "reload");
-  assert.equal(parseMatrixSlashCommand("/new@xo"), "new");
-  assert.equal(parseMatrixSlashCommand(" /balanced\n"), "balanced");
-  assert.equal(parseMatrixSlashCommand("/power now"), undefined);
-  assert.equal(parseMatrixSlashCommand("/unknown"), undefined);
-  assert.equal(parseMatrixSlashCommand("/eco", "voice"), undefined);
+test("prompt identifies text and voice with a configurable tag", () => {
+  assert.equal(buildPrompt(" hello ", "text", "matrix agent"), "[matrix agent]\nhello");
+  assert.equal(buildPrompt(" spoken ", "voice", "matrix agent"), "[matrix agent voice]\nspoken");
 });
 
 test("extracts the last assistant text parts", () => {
@@ -54,7 +47,7 @@ test("extracts the last assistant text parts", () => {
   );
 });
 
-test("prepares and captures before injecting a project-bound turn", async () => {
+test("prepares inbound content before injecting a turn", async () => {
   const order: string[] = [];
   const calls: MatrixIpcRequest[] = [];
   const controller = new MatrixTransportController(CONFIG, {
@@ -91,7 +84,7 @@ test("prepares and captures before injecting a project-bound turn", async () => 
   ]);
 });
 
-test("topic commands send deterministic direct answers without model injection", async () => {
+test("prepared direct answers bypass model injection", async () => {
   const sends: MatrixIpcRequest[] = [];
   let injected = false;
   const controller = new MatrixTransportController(CONFIG, {

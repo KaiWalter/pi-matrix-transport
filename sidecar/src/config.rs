@@ -25,44 +25,47 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        if env::var("MATRIX_XO_ENABLED").as_deref() != Ok("1") {
-            bail!("XO Matrix transport is disabled; set MATRIX_XO_ENABLED=1 explicitly");
+        if env::var("MATRIX_AGENT_ENABLED").as_deref() != Ok("1") {
+            bail!("Matrix transport is disabled; set MATRIX_AGENT_ENABLED=1 explicitly");
         }
 
-        let state_db = required_path("MATRIX_XO_STATE_DB")?;
-        let media_temp_path = required_path("MATRIX_XO_MEDIA_TEMP_PATH")?;
+        let state_db = required_path("MATRIX_AGENT_STATE_DB")?;
+        let media_temp_path = required_path("MATRIX_AGENT_MEDIA_TEMP_PATH")?;
         let expected_media_path = state_db
             .parent()
-            .context("MATRIX_XO_STATE_DB must have a parent directory")?
+            .context("MATRIX_AGENT_STATE_DB must have a parent directory")?
             .join("media-tmp");
         if media_temp_path != expected_media_path {
-            bail!("MATRIX_XO_MEDIA_TEMP_PATH must be the media-tmp sibling of MATRIX_XO_STATE_DB");
+            bail!(
+                "MATRIX_AGENT_MEDIA_TEMP_PATH must be the media-tmp sibling of MATRIX_AGENT_STATE_DB"
+            );
         }
 
         Ok(Self {
-            homeserver: required("MATRIX_XO_HOMESERVER")?,
-            user_id: required("MATRIX_XO_USER_ID")?
+            homeserver: required("MATRIX_AGENT_HOMESERVER")?,
+            user_id: required("MATRIX_AGENT_USER_ID")?
                 .try_into()
-                .context("invalid MATRIX_XO_USER_ID")?,
-            device_id: OwnedDeviceId::from(required("MATRIX_XO_DEVICE_ID")?),
-            access_token_file: required_path("MATRIX_XO_ACCESS_TOKEN_FILE")?,
-            store_path: required_path("MATRIX_XO_STORE_PATH")?,
-            store_passphrase_file: required_path("MATRIX_XO_STORE_PASSPHRASE_FILE")?,
+                .context("invalid MATRIX_AGENT_USER_ID")?,
+            device_id: OwnedDeviceId::from(required("MATRIX_AGENT_DEVICE_ID")?),
+            access_token_file: required_path("MATRIX_AGENT_ACCESS_TOKEN_FILE")?,
+            store_path: required_path("MATRIX_AGENT_STORE_PATH")?,
+            store_passphrase_file: required_path("MATRIX_AGENT_STORE_PASSPHRASE_FILE")?,
             state_db,
-            socket: required_path("MATRIX_XO_SOCKET")?,
+            socket: required_path("MATRIX_AGENT_SOCKET")?,
             media_temp_path,
-            transcribe_command: required_executable("MATRIX_XO_TRANSCRIBE_COMMAND")?,
-            tts_command: required_executable("MATRIX_XO_TTS_COMMAND")?,
-            tts_voice: required("MATRIX_XO_TTS_VOICE")?,
-            room_id: required("MATRIX_XO_ROOM_ID")?
+            transcribe_command: required_executable("MATRIX_AGENT_TRANSCRIBE_COMMAND")?,
+            tts_command: required_executable("MATRIX_AGENT_TTS_COMMAND")?,
+            tts_voice: required("MATRIX_AGENT_TTS_VOICE")?,
+            room_id: required("MATRIX_AGENT_ROOM_ID")?
                 .try_into()
-                .context("invalid MATRIX_XO_ROOM_ID")?,
-            sender_id: required("MATRIX_XO_SENDER_ID")?
+                .context("invalid MATRIX_AGENT_ROOM_ID")?,
+            sender_id: required("MATRIX_AGENT_SENDER_ID")?
                 .try_into()
-                .context("invalid MATRIX_XO_SENDER_ID")?,
-            require_verified_device: env::var("MATRIX_XO_REQUIRE_VERIFIED_DEVICE").as_deref()
+                .context("invalid MATRIX_AGENT_SENDER_ID")?,
+            require_verified_device: env::var("MATRIX_AGENT_REQUIRE_VERIFIED_DEVICE").as_deref()
                 == Ok("1"),
-            allow_cross_signing_repair: env::var("MATRIX_XO_ALLOW_CROSS_SIGNING_REPAIR").as_deref()
+            allow_cross_signing_repair: env::var("MATRIX_AGENT_ALLOW_CROSS_SIGNING_REPAIR")
+                .as_deref()
                 == Ok("1"),
         })
     }

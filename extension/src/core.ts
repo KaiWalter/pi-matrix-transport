@@ -7,8 +7,6 @@ export type MatrixAgentTransportConfig = {
   idempotencyPrefix: string;
   promptTag: string;
   laneLabel: string;
-  topicEnabled: boolean;
-  topicHelperPath: string;
 };
 
 export type PreparedInbound = {
@@ -16,8 +14,6 @@ export type PreparedInbound = {
   directAnswer?: string;
   afterSend?: () => Promise<void> | void;
 };
-
-export type MatrixSlashCommand = "reload" | "new" | "eco" | "balanced" | "power";
 
 export type MatrixTransportDeps = {
   ipc: (request: MatrixIpcRequest) => Promise<MatrixIpcResponse>;
@@ -45,18 +41,16 @@ const LONG_RUNNING_ACTIVITY_MS = 5000;
 
 export function loadConfig(env: NodeJS.ProcessEnv): MatrixAgentTransportConfig {
   const enabled = env.PI_MATRIX_AGENT_ENABLED === "1";
-  const socketPath =
-    env.PI_MATRIX_AGENT_SOCKET?.trim()
-    || env.PI_MATRIX_XO_SOCKET?.trim()
-    || `${env.XDG_RUNTIME_DIR || "/tmp"}/pi-matrix-agent.sock`;
+  const socketPath = env.PI_MATRIX_AGENT_SOCKET?.trim() || "";
+  if (enabled && !socketPath) {
+    throw new Error("PI_MATRIX_AGENT_SOCKET is required when the Matrix extension is enabled");
+  }
   const parsedPoll = Number.parseInt(env.PI_MATRIX_AGENT_POLL_MS || "1000", 10);
   const pollMs = Number.isFinite(parsedPoll) ? Math.min(30000, Math.max(250, parsedPoll)) : 1000;
   const idempotencyPrefix = env.PI_MATRIX_AGENT_IDEMPOTENCY_PREFIX?.trim() || "matrix-reply";
   const promptTag = env.PI_MATRIX_AGENT_PROMPT_TAG?.trim() || "matrix";
   const laneLabel = env.PI_MATRIX_AGENT_LABEL?.trim() || "Matrix lane";
-  const topicEnabled = env.PI_MATRIX_TOPIC_ENABLED === "1";
-  const topicHelperPath = env.PI_MATRIX_TOPIC_HELPER?.trim() || "";
-  return { enabled, socketPath, pollMs, idempotencyPrefix, promptTag, laneLabel, topicEnabled, topicHelperPath };
+  return { enabled, socketPath, pollMs, idempotencyPrefix, promptTag, laneLabel };
 }
 
 export class MatrixTransportController {
@@ -118,7 +112,7 @@ export class MatrixTransportController {
         this.deps.inject(prompt);
         this.deps.log("info", `${this.config.laneLabel}: injected one Matrix turn`);
       } catch {
-        this.active.answer = "Project topic routing failed closed. No project capture was processed; please check the binding and retry.";
+        this.active.answer = "Inbound preparation failed closed. No agent turn was started; please check the integration and retry.";
         await this.flushAnswer();
       }
     } catch {
@@ -342,54 +336,6 @@ export class MatrixTransportController {
     const exponentialDelayMs = 5000 * 2 ** Math.min(6, this.answerRetryCount - 1);
     return Math.min(300000, exponentialDelayMs);
   }
-}
-
-const MATRIX_SLASH_COMMANDS = new Set<MatrixSlashCommand>([
-  "reload",
-  "new",
-  "eco",
-  "balanced",
-  "power",
-]);
-
-const MATRIX_SLASH_COMMAND_RE = /^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/;
-
-function normalizeSlashBody(raw: string): string {
-  let value = raw
-    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
-    .trim();
-
-  const htmlParagraph = value.match(/^<p>([\s\S]*)<\/p>$/i);
-  if (htmlParagraph) value = htmlParagraph[1]?.trim() ?? "";
-
-  if (value.startsWith("`") && value.endsWith("`") && value.length >= 2) {
-    value = value.slice(1, -1).trim();
-  }
-
-  return value;
-}
-
-export function parseMatrixSlashCommand(
-  body: string,
-  kind: MatrixInboundEvent["kind"] = "text",
-): MatrixSlashCommand | undefined {
-  if (kind !== "text") return undefined;
-  const trimmed = normalizeSlashBody(body);
-  if (!trimmed) return undefined;
-
-  const bare = trimmed.toLowerCase();
-  if ((bare === "new" || bare === "reload" || bare === "eco" || bare === "balanced" || bare === "power")
-    && MATRIX_SLASH_COMMANDS.has(bare as MatrixSlashCommand)) {
-    return bare as MatrixSlashCommand;
-  }
-
-  const match = trimmed.match(MATRIX_SLASH_COMMAND_RE);
-  if (!match) return undefined;
-  const command = match[1]?.toLowerCase();
-  if (!command || !MATRIX_SLASH_COMMANDS.has(command as MatrixSlashCommand)) return undefined;
-  const remainder = trimmed.slice(match[0].length).trim();
-  if (remainder.length > 0) return undefined;
-  return command as MatrixSlashCommand;
 }
 
 function modelRetryDelayMs(retryCount: number): number {
