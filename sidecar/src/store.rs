@@ -154,9 +154,11 @@ impl StateStore {
             .expect("state database mutex poisoned");
         let transaction = connection.transaction()?;
         let now = now_epoch()?;
+        // Reclaim only very stale claims to avoid stealing long-running turns
+        // from active workers in multi-room setups.
         transaction.execute(
             "UPDATE inbound SET state='queued', claimed_at=NULL WHERE state='claimed' AND claimed_at <= ?1",
-            [now - 300],
+            [now - 7_200],
         )?;
 
         let event = if let Some(room_id) = room_id {
