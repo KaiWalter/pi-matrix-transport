@@ -2,8 +2,14 @@ import net from "node:net";
 
 export type MatrixInboundEvent = {
   event_id: string;
+  room_id: string;
   body: string;
   kind: "text" | "voice";
+};
+
+export type MatrixProjectRoomBinding = {
+  project_slug: string;
+  room_id: string;
 };
 
 export type MatrixIpcResponse = {
@@ -12,16 +18,21 @@ export type MatrixIpcResponse = {
   event?: MatrixInboundEvent;
   error?: string;
   matrix_event_id?: string;
+  room_id?: string;
+  project_rooms?: MatrixProjectRoomBinding[];
 };
 
 export type MatrixIpcRequest =
   | { op: "status" }
-  | { op: "claim" }
+  | { op: "claim"; room_id?: string }
   | { op: "activity_start"; event_id: string }
   | { op: "activity_heartbeat"; event_id: string; status_event_id?: string; long_running: boolean }
   | { op: "activity_stop"; event_id: string; status_event_id?: string; outcome: "done" | "stopped" }
   | { op: "release"; event_id: string }
-  | { op: "send"; event_id: string; idempotency_key: string; body: string };
+  | { op: "send"; event_id: string; idempotency_key: string; body: string }
+  | { op: "project_room_add"; project_slug: string; display_name?: string }
+  | { op: "project_room_remove"; project_slug: string }
+  | { op: "project_room_list" };
 
 export async function request(
   socketPath: string,

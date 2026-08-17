@@ -7,6 +7,7 @@ export type MatrixAgentTransportConfig = {
   idempotencyPrefix: string;
   promptTag: string;
   laneLabel: string;
+  roomId?: string;
 };
 
 export type PreparedInbound = {
@@ -50,7 +51,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): MatrixAgentTransportConfig {
   const idempotencyPrefix = env.PI_MATRIX_AGENT_IDEMPOTENCY_PREFIX?.trim() || "matrix-reply";
   const promptTag = env.PI_MATRIX_AGENT_PROMPT_TAG?.trim() || "matrix";
   const laneLabel = env.PI_MATRIX_AGENT_LABEL?.trim() || "Matrix lane";
-  return { enabled, socketPath, pollMs, idempotencyPrefix, promptTag, laneLabel };
+  const roomId = env.PI_MATRIX_AGENT_ROOM_ID?.trim() || undefined;
+  return { enabled, socketPath, pollMs, idempotencyPrefix, promptTag, laneLabel, roomId };
 }
 
 export class MatrixTransportController {
@@ -87,7 +89,10 @@ export class MatrixTransportController {
         return;
       }
       if (!this.safeIsIdle()) return;
-      const response = await this.deps.ipc({ op: "claim" });
+      const claimRequest = this.config.roomId
+        ? { op: "claim", room_id: this.config.roomId } as const
+        : { op: "claim" } as const;
+      const response = await this.deps.ipc(claimRequest);
       this.markSidecarAvailable();
       if (!response.ok || !response.event) return;
       if (!validInbound(response.event)) {
@@ -383,6 +388,8 @@ export function extractFinalAssistantText(messages: unknown[]): string | undefin
 function validInbound(event: MatrixInboundEvent): boolean {
   return typeof event.event_id === "string"
     && event.event_id.length > 0
+    && typeof event.room_id === "string"
+    && event.room_id.length > 0
     && typeof event.body === "string"
     && event.body.trim().length > 0
     && (event.kind === "text" || event.kind === "voice")

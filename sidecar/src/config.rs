@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::{collections::BTreeSet, env, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
 use matrix_sdk::ruma::{OwnedDeviceId, OwnedRoomId, OwnedUserId};
@@ -18,6 +18,7 @@ pub struct Config {
     pub tts_command: PathBuf,
     pub tts_voice: String,
     pub room_id: OwnedRoomId,
+    pub room_ids: Vec<OwnedRoomId>,
     pub sender_id: OwnedUserId,
     pub require_verified_device: bool,
     pub allow_cross_signing_repair: bool,
@@ -41,6 +42,24 @@ impl Config {
             );
         }
 
+        let room_id: OwnedRoomId = required("MATRIX_AGENT_ROOM_ID")?
+            .try_into()
+            .context("invalid MATRIX_AGENT_ROOM_ID")?;
+        let mut room_ids = BTreeSet::new();
+        room_ids.insert(room_id.clone());
+        if let Ok(additional_rooms) = env::var("MATRIX_AGENT_ROOM_IDS") {
+            for candidate in additional_rooms
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let parsed: OwnedRoomId = candidate
+                    .try_into()
+                    .with_context(|| format!("invalid MATRIX_AGENT_ROOM_IDS entry: {candidate}"))?;
+                room_ids.insert(parsed);
+            }
+        }
+
         Ok(Self {
             homeserver: required("MATRIX_AGENT_HOMESERVER")?,
             user_id: required("MATRIX_AGENT_USER_ID")?
@@ -56,9 +75,8 @@ impl Config {
             transcribe_command: required_executable("MATRIX_AGENT_TRANSCRIBE_COMMAND")?,
             tts_command: required_executable("MATRIX_AGENT_TTS_COMMAND")?,
             tts_voice: required("MATRIX_AGENT_TTS_VOICE")?,
-            room_id: required("MATRIX_AGENT_ROOM_ID")?
-                .try_into()
-                .context("invalid MATRIX_AGENT_ROOM_ID")?,
+            room_id,
+            room_ids: room_ids.into_iter().collect(),
             sender_id: required("MATRIX_AGENT_SENDER_ID")?
                 .try_into()
                 .context("invalid MATRIX_AGENT_SENDER_ID")?,

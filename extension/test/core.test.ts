@@ -53,7 +53,7 @@ test("prepares inbound content before injecting a turn", async () => {
   const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request): Promise<MatrixIpcResponse> => {
       calls.push(request);
-      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
+      if (request.op === "claim") return { ok: true, event: { event_id: "$one", room_id: "!room:test", body: "hello", kind: "text" } };
       if (request.op === "activity_start") return { ok: true, status: "activity_started", matrix_event_id: "$activity" };
       return { ok: true, status: "sent" };
     },
@@ -89,7 +89,7 @@ test("prepared direct answers bypass model injection", async () => {
   let injected = false;
   const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request): Promise<MatrixIpcResponse> => {
-      if (request.op === "claim") return { ok: true, event: { event_id: "$cmd", body: "/topic status", kind: "text" } };
+      if (request.op === "claim") return { ok: true, event: { event_id: "$cmd", room_id: "!room:test", body: "/topic status", kind: "text" } };
       sends.push(request);
       return { ok: true, status: "sent" };
     },
@@ -115,7 +115,7 @@ test("preparation failure fails closed without model injection", async () => {
   const sends: MatrixIpcRequest[] = [];
   const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request): Promise<MatrixIpcResponse> => {
-      if (request.op === "claim") return { ok: true, event: { event_id: "$bad", body: "hello", kind: "text" } };
+      if (request.op === "claim") return { ok: true, event: { event_id: "$bad", room_id: "!room:test", body: "hello", kind: "text" } };
       sends.push(request);
       return { ok: true, status: "sent" };
     },
@@ -135,7 +135,7 @@ test("retryable provider error is never sent to Matrix and keeps the turn active
   const sends: MatrixIpcRequest[] = [];
   const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request): Promise<MatrixIpcResponse> => {
-      if (request.op === "claim") return { ok: true, event: { event_id: "$retry", body: "hello", kind: "text" } };
+      if (request.op === "claim") return { ok: true, event: { event_id: "$retry", room_id: "!room:test", body: "hello", kind: "text" } };
       sends.push(request);
       return { ok: true, status: "sent" };
     },
@@ -160,7 +160,7 @@ test("long-running turns refresh typing and update one sanitized notice", async 
     const controller = new MatrixTransportController(CONFIG, {
       ipc: async (request) => {
         calls.push(request);
-        if (request.op === "claim") return { ok: true, event: { event_id: "$long", body: "hello", kind: "text" } };
+        if (request.op === "claim") return { ok: true, event: { event_id: "$long", room_id: "!room:test", body: "hello", kind: "text" } };
         if (request.op === "activity_start") return { ok: true, status: "activity_started", matrix_event_id: "$activity" };
         return { ok: true, status: "activity_refreshed" };
       },
@@ -198,7 +198,7 @@ test("session shutdown releases an unanswered claim", async () => {
   const controller = new MatrixTransportController(CONFIG, {
     ipc: async (request) => {
       calls.push(request);
-      if (request.op === "claim") return { ok: true, event: { event_id: "$one", body: "hello", kind: "text" } };
+      if (request.op === "claim") return { ok: true, event: { event_id: "$one", room_id: "!room:test", body: "hello", kind: "text" } };
       if (request.op === "activity_start") return { ok: true, status: "activity_started", matrix_event_id: "$activity" };
       return { ok: true, status: "released" };
     },

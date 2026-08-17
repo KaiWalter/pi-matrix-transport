@@ -6,6 +6,7 @@ use std::{os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc, t
 
 use anyhow::{bail, Context, Result};
 use config::Config;
+use matrix_sdk::ruma::api::client::room::create_room;
 use matrix_sdk::{
     attachment::AttachmentConfig,
     authentication::{matrix::MatrixSession, SessionTokens},
@@ -23,7 +24,7 @@ use matrix_sdk::{
 };
 use protocol::{ActivityOutcome, Request, Response};
 use sha2::{Digest, Sha256};
-use store::StateStore;
+use store::{SourceEventContext, StateStore};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -216,7 +217,12 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let access_token = read_secret(&config.access_token_file).await?;
     let store_passphrase = read_secret(&config.store_passphrase_file).await?;
-    let state = StateStore::open(&config.state_db)?;
+    let allowed_rooms = config
+        .room_ids
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let state = StateStore::open(&config.state_db, config.room_id.as_str(), &allowed_rooms)?;
     secure_directory(&config.store_path).await?;
     secure_directory(&config.media_temp_path).await?;
     clear_private_temp_directory(&config.media_temp_path).await?;
@@ -408,8 +414,7 @@ async fn accept_inbound(
     room: Room,
     client: Client,
 ) {
-    if room.room_id() != app.config.room_id
-        || room.state() != RoomState::Joined
+    if room.state() != RoomState::Joined
         || event.sender != app.config.sender_id
         || event.sender == client.user_id().expect("restored session has user id")
         || event.content.relates_to.is_some()
@@ -420,6 +425,16 @@ async fn accept_inbound(
         Ok(state) if state.is_encrypted() => {}
         _ => return,
     }
+    let room_id = room.room_id().to_string();
+    match app.state.room_enabled(&room_id) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            tracing::error!("failed to inspect room binding state");
+            return;
+        }
+    }
+
     let event_id = event.event_id.to_string();
     match app.state.contains_event(&event_id) {
         Ok(true) => {
@@ -438,7 +453,7 @@ async fn accept_inbound(
             if body.is_empty() || body.chars().count() > MAX_MESSAGE_CHARS {
                 return;
             }
-            app.state.enqueue(&event_id, body, "text")
+            app.state.enqueue(&event_id, &room_id, body, "text")
         }
         MessageType::Audio(audio) => {
             let transcript = match transcribe_audio(&app, audio).await {
@@ -452,7 +467,7 @@ async fn accept_inbound(
                     VOICE_PROCESSING_ERROR_MESSAGE.to_owned()
                 }
             };
-            app.state.enqueue(&event_id, &transcript, "voice")
+            app.state.enqueue(&event_id, &room_id, &transcript, "voice")
         }
         _ => return,
     };
@@ -666,10 +681,10 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             let (queued, claimed, completed) = app.state.counts()?;
             Ok(Response::status(queued, claimed, completed))
         }
-        Request::Claim => Ok(Response::claim(app.state.claim()?)),
+        Request::Claim { room_id } => Ok(Response::claim(app.state.claim(room_id.as_deref())?)),
         Request::ActivityStart { event_id } => {
-            ensure_source_event(app, &event_id)?;
-            let room = activity_room(app).await?;
+            let source = ensure_source_event(app, &event_id)?;
+            let room = room_for_source(app, &source).await?;
             room.typing_notice(true).await?;
             let sent = room
                 .send(RoomMessageEventContent::notice_plain("Processing…"))
@@ -687,8 +702,8 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             status_event_id,
             long_running,
         } => {
-            ensure_source_event(app, &event_id)?;
-            let room = activity_room(app).await?;
+            let source = ensure_source_event(app, &event_id)?;
+            let room = room_for_source(app, &source).await?;
             room.typing_notice(true).await?;
             if long_running {
                 if let Some(status_event_id) = status_event_id {
@@ -703,8 +718,8 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             status_event_id,
             outcome,
         } => {
-            ensure_source_event(app, &event_id)?;
-            let room = activity_room(app).await?;
+            let source = ensure_source_event(app, &event_id)?;
+            let room = room_for_source(app, &source).await?;
             room.typing_notice(false).await?;
             if let Some(status_event_id) = status_event_id {
                 let (body, phase) = match outcome {
@@ -737,21 +752,10 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             if let Some(matrix_event_id) = app.state.outbound_event(&idempotency_key)? {
                 return Ok(Response::done("duplicate", Some(matrix_event_id)));
             }
-            let room = app
-                .client
-                .get_room(&app.config.room_id)
-                .context("configured room unavailable")?;
-            if room.state() != RoomState::Joined
-                || !room.latest_encryption_state().await?.is_encrypted()
-            {
-                bail!("configured room is not joined and encrypted");
-            }
+            let source = ensure_source_event(app, &event_id)?;
+            let room = room_for_source(app, &source).await?;
             let transaction_id = deterministic_transaction_id(&idempotency_key);
-            let kind = app
-                .state
-                .inbound_kind(&event_id)?
-                .context("source event unavailable")?;
-            let sent = if kind == "voice" {
+            let sent = if source.kind == "voice" {
                 match send_audio_reply(app, &room, body.trim(), transaction_id.clone()).await {
                     Ok(sent) => sent,
                     Err(_) => {
@@ -771,25 +775,93 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
                 .complete(&event_id, &idempotency_key, &matrix_event_id)?;
             Ok(Response::done("sent", Some(matrix_event_id)))
         }
+        Request::ProjectRoomAdd {
+            project_slug,
+            display_name,
+        } => {
+            let project_slug = normalize_project_slug(&project_slug)?;
+            if let Some(room_id) = app.state.room_for_project(&project_slug)? {
+                return Ok(Response::room("project_room_exists", room_id));
+            }
+            let room_name = display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Project · {}", project_slug.replace('-', " ")));
+            let room = create_project_room(app, &room_name).await?;
+            let room_id = room.room_id().to_string();
+            app.state
+                .upsert_room_binding(&room_id, Some(&project_slug))?;
+            Ok(Response::room("project_room_created", room_id))
+        }
+        Request::ProjectRoomRemove { project_slug } => {
+            let project_slug = normalize_project_slug(&project_slug)?;
+            let Some(room_id) = app.state.room_for_project(&project_slug)? else {
+                return Ok(Response::done("project_room_absent", None));
+            };
+            app.state.remove_room_binding(&room_id)?;
+            leave_room_best_effort(app, &room_id).await?;
+            Ok(Response::room("project_room_removed", room_id))
+        }
+        Request::ProjectRoomList => Ok(Response::project_rooms(app.state.list_project_rooms()?)),
     }
 }
 
-fn ensure_source_event(app: &App, event_id: &str) -> Result<()> {
+fn ensure_source_event(app: &App, event_id: &str) -> Result<SourceEventContext> {
     app.state
-        .inbound_kind(event_id)?
-        .context("source event unavailable")?;
-    Ok(())
+        .source_context(event_id)?
+        .context("source event unavailable")
 }
 
-async fn activity_room(app: &App) -> Result<Room> {
+async fn room_for_source(app: &App, source: &SourceEventContext) -> Result<Room> {
+    let room_id: matrix_sdk::ruma::OwnedRoomId = source
+        .room_id
+        .parse()
+        .context("source event has invalid room id")?;
     let room = app
         .client
-        .get_room(&app.config.room_id)
-        .context("configured room unavailable")?;
+        .get_room(&room_id)
+        .context("source room unavailable")?;
     if room.state() != RoomState::Joined || !room.latest_encryption_state().await?.is_encrypted() {
-        bail!("configured room is not joined and encrypted");
+        bail!("source room is not joined and encrypted");
     }
     Ok(room)
+}
+
+fn normalize_project_slug(value: &str) -> Result<String> {
+    let slug = value.trim().to_ascii_lowercase();
+    if slug.is_empty()
+        || !slug.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+        || slug.starts_with('-')
+        || slug.ends_with('-')
+    {
+        bail!("project slug must be lowercase kebab-case");
+    }
+    Ok(slug)
+}
+
+async fn create_project_room(app: &App, room_name: &str) -> Result<Room> {
+    let mut request = create_room::v3::Request::new();
+    request.name = Some(room_name.to_owned());
+    request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
+    request.is_direct = false;
+    request.invite = vec![app.config.sender_id.clone()];
+
+    let room = app.client.create_room(request).await?;
+    Ok(room)
+}
+
+async fn leave_room_best_effort(app: &App, room_id: &str) -> Result<()> {
+    let room_id: matrix_sdk::ruma::OwnedRoomId = room_id.parse().context("invalid room id")?;
+    if let Some(room) = app.client.get_room(&room_id) {
+        if room.state() == RoomState::Joined {
+            room.leave().await?;
+        }
+    }
+    Ok(())
 }
 
 async fn edit_activity_notice(

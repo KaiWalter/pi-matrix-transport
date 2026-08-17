@@ -1,15 +1,17 @@
+> Disclaimer: This repository is AI-generated and may contain errors. Review and validate all changes before production use.
+
 # pi-matrix-transport
 
-`pi-matrix-transport` connects a [Pi coding agent](https://github.com/badlogic/pi-mono) to one end-to-end encrypted Matrix room.
+`pi-matrix-transport` connects a [Pi coding agent](https://github.com/badlogic/pi-mono) to one or more end-to-end encrypted Matrix rooms.
 
-It is intended for a small, tightly controlled deployment: one Matrix account, one encrypted room, one allowed sender, and one active FIFO conversation. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text or, for an audio-origin turn, an encrypted MP3 attachment.
+It is intended for a small, tightly controlled deployment: one Matrix account/device owner sidecar, one allowed sender, explicit room bindings, and FIFO conversation handling. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text or, for an audio-origin turn, an encrypted MP3 attachment.
 
 The transport is **default-off** and fails closed unless both components are explicitly enabled.
 
 ## What it provides
 
 - End-to-end encrypted Matrix send and receive through `matrix-sdk`
-- Exact room and sender allowlists
+- Exact room and sender allowlists, including room-scoped claims for dedicated worker lanes
 - Durable SQLite FIFO queue, event deduplication, and outbound idempotency
 - A mode-`0600` Unix-socket API between Matrix and Pi; no TCP listener
 - Text input and bounded encrypted audio input with an external transcription command
@@ -147,7 +149,8 @@ Every variable in the following table is required unless marked optional.
 | `MATRIX_AGENT_TRANSCRIBE_COMMAND` | Executable transcription command path. |
 | `MATRIX_AGENT_TTS_COMMAND` | Executable text-to-speech command path. |
 | `MATRIX_AGENT_TTS_VOICE` | Voice identifier passed to the TTS command. |
-| `MATRIX_AGENT_ROOM_ID` | Exact encrypted room allowlist entry. Treat as sensitive deployment data. |
+| `MATRIX_AGENT_ROOM_ID` | Default encrypted room allowlist entry. Treat as sensitive deployment data. |
+| `MATRIX_AGENT_ROOM_IDS` | Optional comma-separated additional encrypted room IDs to preload as allowlisted bindings. |
 | `MATRIX_AGENT_SENDER_ID` | Exact sender allowlist entry. Treat as sensitive deployment data. |
 | `MATRIX_AGENT_REQUIRE_VERIFIED_DEVICE` | Optional; `1` enforces the verified-device gate. |
 | `MATRIX_AGENT_ALLOW_CROSS_SIGNING_REPAIR` | Optional; `1` permits controlled cross-signing repair/bootstrap. Keep disabled during normal operation. |
@@ -164,6 +167,7 @@ Secret files must be non-empty regular files with no group/world permission bits
 | `PI_MATRIX_AGENT_IDEMPOTENCY_PREFIX` | Outbound idempotency namespace; default `matrix-reply`. |
 | `PI_MATRIX_AGENT_PROMPT_TAG` | Tag placed on injected turns; default `matrix`. |
 | `PI_MATRIX_AGENT_LABEL` | Content-free operational log label; default `Matrix lane`. |
+| `PI_MATRIX_AGENT_ROOM_ID` | Optional room-scoped claim filter for dedicated project workers. |
 
 The extension entry point is declared in `extension/package.json`. Install or reference that directory using the local-extension mechanism supported by your Pi deployment, then set its socket path to exactly the same path used by the sidecar.
 
@@ -217,8 +221,8 @@ You remain responsible for host hardening, secret provisioning, Matrix account l
 
 ## Bounds and limitations
 
-- One configured room and one configured sender per sidecar instance
-- One active FIFO turn at a time
+- One configured sender and one or more explicitly bound rooms per sidecar instance
+- FIFO claim semantics per sidecar; workers can scope claims by room id
 - Accepted inbound event types: plain Matrix text and Matrix audio
 - Replies, edits, reactions, threads, images, and general file attachments are not handled
 - Text and transcript limit: 16,000 characters

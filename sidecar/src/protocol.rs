@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 
-use crate::store::InboundEvent;
+use crate::store::{InboundEvent, ProjectRoomBinding};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
-    Claim,
+    Claim {
+        #[serde(default)]
+        room_id: Option<String>,
+    },
     ActivityStart {
         event_id: String,
     },
@@ -28,6 +31,15 @@ pub enum Request {
         idempotency_key: String,
         body: String,
     },
+    ProjectRoomAdd {
+        project_slug: String,
+        #[serde(default)]
+        display_name: Option<String>,
+    },
+    ProjectRoomRemove {
+        project_slug: String,
+    },
+    ProjectRoomList,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -53,6 +65,10 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matrix_event_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_rooms: Option<Vec<ProjectRoomBinding>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<&'static str>,
 }
 
@@ -66,6 +82,8 @@ impl Response {
             claimed: Some(claimed),
             completed: Some(completed),
             matrix_event_id: None,
+            room_id: None,
+            project_rooms: None,
             error: None,
         }
     }
@@ -79,6 +97,8 @@ impl Response {
             claimed: None,
             completed: None,
             matrix_event_id: None,
+            room_id: None,
+            project_rooms: None,
             error: None,
         }
     }
@@ -92,6 +112,38 @@ impl Response {
             claimed: None,
             completed: None,
             matrix_event_id,
+            room_id: None,
+            project_rooms: None,
+            error: None,
+        }
+    }
+
+    pub fn room(status: &'static str, room_id: String) -> Self {
+        Self {
+            ok: true,
+            status: Some(status),
+            event: None,
+            queued: None,
+            claimed: None,
+            completed: None,
+            matrix_event_id: None,
+            room_id: Some(room_id),
+            project_rooms: None,
+            error: None,
+        }
+    }
+
+    pub fn project_rooms(bindings: Vec<ProjectRoomBinding>) -> Self {
+        Self {
+            ok: true,
+            status: Some("project_rooms"),
+            event: None,
+            queued: None,
+            claimed: None,
+            completed: None,
+            matrix_event_id: None,
+            room_id: None,
+            project_rooms: Some(bindings),
             error: None,
         }
     }
@@ -105,6 +157,8 @@ impl Response {
             claimed: None,
             completed: None,
             matrix_event_id: None,
+            room_id: None,
+            project_rooms: None,
             error: Some(error),
         }
     }
@@ -116,6 +170,18 @@ mod tests {
 
     #[test]
     fn activity_requests_decode_with_fixed_fields() {
+        let claim: Request = serde_json::from_str(r#"{"op":"claim"}"#).unwrap();
+        assert!(matches!(claim, Request::Claim { room_id: None }));
+
+        let scoped_claim: Request =
+            serde_json::from_str(r#"{"op":"claim","room_id":"!ea:example.org"}"#).unwrap();
+        assert!(matches!(
+            scoped_claim,
+            Request::Claim {
+                room_id: Some(room_id)
+            } if room_id == "!ea:example.org"
+        ));
+
         let start: Request =
             serde_json::from_str(r#"{"op":"activity_start","event_id":"$source"}"#).unwrap();
         assert!(matches!(start, Request::ActivityStart { event_id } if event_id == "$source"));
