@@ -2,9 +2,19 @@ mod config;
 mod protocol;
 mod store;
 
-use std::{os::unix::fs::PermissionsExt, path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    process::Stdio,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
+use chrono::Utc;
 use config::Config;
 use matrix_sdk::ruma::api::client::room::create_room;
 use matrix_sdk::{
@@ -41,6 +51,7 @@ const TTS_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_TRANSCRIPT_BYTES: u64 = 65_536;
 const VOICE_PROCESSING_ERROR_MESSAGE: &str =
     "I could not transcribe this Matrix voice message. Please resend it.";
+static OUTBOUND_AUDIO_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Builds a Matrix `m.text` event with the original text as the interoperable
 /// fallback and Matrix-safe HTML generated from Markdown for capable clients.
@@ -610,6 +621,12 @@ fn spoken_overview(body: &str) -> String {
     }
 }
 
+fn outbound_audio_filename() -> String {
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%S%9fZ");
+    let sequence = OUTBOUND_AUDIO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("matrix-reply-{timestamp}-{sequence:08}.mp3")
+}
+
 async fn send_audio_reply(
     app: &App,
     room: &Room,
@@ -649,7 +666,7 @@ async fn send_audio_reply(
     let content_type: mime::Mime = "audio/mpeg".parse()?;
     Ok(room
         .send_attachment(
-            "matrix-reply.mp3",
+            outbound_audio_filename(),
             &content_type,
             data,
             AttachmentConfig::new().txn_id(transaction_id),
@@ -935,7 +952,31 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 
 #[cfg(test)]
 mod tests {
-    use super::{deterministic_transaction_id, rich_text_reply, speech_text, spoken_overview};
+    use super::{
+        deterministic_transaction_id, outbound_audio_filename, rich_text_reply, speech_text,
+        spoken_overview,
+    };
+
+    #[test]
+    fn outbound_audio_filenames_are_punctuation_free_and_unique() {
+        let first = outbound_audio_filename();
+        let second = outbound_audio_filename();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("matrix-reply-"));
+        assert!(first.ends_with(".mp3"));
+        let timestamp = first
+            .strip_prefix("matrix-reply-")
+            .and_then(|value| value.split_once('-'))
+            .expect("filename contains timestamp")
+            .0;
+        assert_eq!(timestamp.len(), 25);
+        assert_eq!(&timestamp[8..9], "T");
+        assert!(timestamp.ends_with('Z'));
+        assert!(timestamp[..24]
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == 'T'));
+    }
 
     #[test]
     fn transaction_id_is_stable_and_opaque() {

@@ -2264,6 +2264,7 @@ name = "pi-matrix-transport-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "matrix-sdk",
  "mime",
  "rusqlite",

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 anyhow = "=1.0.100"
+chrono = "=0.4.45"
 matrix-sdk = { version = "=0.16.0", features = ["bundled-sqlite", "markdown"] }
 mime = "=0.3.17"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
