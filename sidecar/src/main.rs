@@ -580,13 +580,42 @@ async fn transcribe_audio(app: &App, audio: AudioMessageEventContent) -> Result<
     Ok(Some(transcript))
 }
 
+fn spoken_overview(body: &str) -> String {
+    let speech = speech_text(body);
+    if speech.is_empty() {
+        return String::new();
+    }
+
+    const MAX_OVERVIEW_CHARS: usize = 420;
+    let mut overview = String::new();
+    for word in speech.split_whitespace() {
+        let needed = if overview.is_empty() {
+            word.len()
+        } else {
+            word.len() + 1
+        };
+        if overview.chars().count() + needed > MAX_OVERVIEW_CHARS {
+            break;
+        }
+        if !overview.is_empty() {
+            overview.push(' ');
+        }
+        overview.push_str(word);
+    }
+
+    if overview.is_empty() {
+        speech
+    } else {
+        overview
+    }
+}
+
 async fn send_audio_reply(
     app: &App,
     room: &Room,
-    body: &str,
+    speech: &str,
     transaction_id: OwnedTransactionId,
 ) -> Result<matrix_sdk::ruma::api::client::message::send_message_event::v3::Response> {
-    let speech = speech_text(body);
     if speech.is_empty() {
         bail!("Matrix reply has no speakable content");
     }
@@ -754,23 +783,37 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
             }
             let source = ensure_source_event(app, &event_id)?;
             let room = room_for_source(app, &source).await?;
-            let transaction_id = deterministic_transaction_id(&idempotency_key);
-            let sent = if source.kind == "voice" {
-                match send_audio_reply(app, &room, body.trim(), transaction_id.clone()).await {
-                    Ok(sent) => sent,
+            let matrix_event_id = if source.kind == "voice" {
+                let text_sent = room
+                    .send(rich_text_reply(&body))
+                    .with_transaction_id(deterministic_transaction_id(&format!(
+                        "{idempotency_key}:text"
+                    )))
+                    .await?;
+                let speech = spoken_overview(body.trim());
+                match send_audio_reply(
+                    app,
+                    &room,
+                    &speech,
+                    deterministic_transaction_id(&format!("{idempotency_key}:audio")),
+                )
+                .await
+                {
+                    Ok(_audio_sent) => text_sent.event_id.to_string(),
                     Err(_) => {
-                        tracing::warn!("audio reply failed; using encrypted text fallback");
-                        room.send(rich_text_reply(&body))
-                            .with_transaction_id(transaction_id)
-                            .await?
+                        tracing::warn!(
+                            "audio overview reply failed; retained encrypted text detail reply"
+                        );
+                        text_sent.event_id.to_string()
                     }
                 }
             } else {
                 room.send(rich_text_reply(&body))
-                    .with_transaction_id(transaction_id)
+                    .with_transaction_id(deterministic_transaction_id(&idempotency_key))
                     .await?
+                    .event_id
+                    .to_string()
             };
-            let matrix_event_id = sent.event_id.to_string();
             app.state
                 .complete(&event_id, &idempotency_key, &matrix_event_id)?;
             Ok(Response::done("sent", Some(matrix_event_id)))
@@ -892,7 +935,7 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 
 #[cfg(test)]
 mod tests {
-    use super::{deterministic_transaction_id, rich_text_reply, speech_text};
+    use super::{deterministic_transaction_id, rich_text_reply, speech_text, spoken_overview};
 
     #[test]
     fn transaction_id_is_stable_and_opaque() {
@@ -917,6 +960,14 @@ mod tests {
             speech_text("1. First item\n2. Second item\n\n```text\nlet value = 1;\n```"),
             "First item\nSecond item\nlet value = 1;",
         );
+    }
+
+    #[test]
+    fn spoken_overview_is_bounded_and_non_empty_for_text() {
+        let source = "Status update with several details that should be shortened for spoken output while keeping the key meaning available for quick listening.";
+        let overview = spoken_overview(source);
+        assert!(!overview.is_empty());
+        assert!(overview.chars().count() <= 420);
     }
 
     #[test]

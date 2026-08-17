@@ -4,7 +4,7 @@
 
 `pi-matrix-transport` connects a [Pi coding agent](https://github.com/badlogic/pi-mono) to one or more end-to-end encrypted Matrix rooms.
 
-It is intended for a small, tightly controlled deployment: one Matrix account/device owner sidecar, one allowed sender, explicit room bindings, and FIFO conversation handling. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text or, for an audio-origin turn, an encrypted MP3 attachment.
+It is intended for a small, tightly controlled deployment: one Matrix account/device owner sidecar, one allowed sender, explicit room bindings, and FIFO conversation handling. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text. For an audio-origin turn, the sidecar sends encrypted text detail plus an encrypted MP3 spoken overview.
 
 The transport is **default-off** and fails closed unless both components are explicitly enabled.
 
@@ -16,7 +16,7 @@ The transport is **default-off** and fails closed unless both components are exp
 - A mode-`0600` Unix-socket API between Matrix and Pi; no TCP listener
 - Text input and bounded encrypted audio input with an external transcription command
 - Markdown-aware encrypted text replies
-- Audio replies for audio-origin turns through an external text-to-speech command, with encrypted-text fallback
+- Audio-origin replies deliver encrypted text detail plus a spoken encrypted MP3 overview through an external text-to-speech command (text-only if synthesis fails)
 - Typing notifications and one sanitized progress notice (`Processing…`, `Still working…`, `Done.` or `Stopped.`)
 - Optional enforcement that the configured Matrix device is cross-signed and verified
 
