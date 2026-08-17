@@ -255,7 +255,6 @@ async fn main() -> Result<()> {
             },
         })
         .await?;
-    enforce_device_trust(&client, &config).await?;
 
     let app = Arc::new(App {
         config,
@@ -272,7 +271,11 @@ async fn main() -> Result<()> {
 
     // Register the handler before the initial sync so events received while the
     // sidecar was offline are durably queued instead of skipped by next_batch.
+    // The restored device must complete one sync before the trust gate: the SDK
+    // initializes and uploads its device keys during that sync, which is required
+    // before a new account can self-cross-sign the configured device.
     let response = client.sync_once(SyncSettings::default()).await?;
+    enforce_device_trust(&client, &app.config).await?;
     let room = client
         .get_room(&app.config.room_id)
         .context("configured room is unavailable")?;
