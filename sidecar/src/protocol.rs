@@ -31,6 +31,17 @@ pub enum Request {
         idempotency_key: String,
         body: String,
     },
+    /// Local scheduled delivery. The sidecar selects its configured room;
+    /// callers cannot supply a room or recipient.
+    SendConfiguredRoomText {
+        idempotency_key: String,
+        body: String,
+    },
+    /// Local scheduled audio delivery to the configured room only.
+    SendConfiguredRoomAudio {
+        idempotency_key: String,
+        speech: String,
+    },
     ProjectRoomAdd {
         project_slug: String,
         #[serde(default)]
@@ -212,5 +223,21 @@ mod tests {
     fn activity_requests_reject_arbitrary_progress_content() {
         let request = r#"{"op":"activity_start","event_id":"$source","body":"private reasoning"}"#;
         assert!(serde_json::from_str::<Request>(request).is_err());
+    }
+
+    #[test]
+    fn proactive_requests_have_no_caller_selected_room() {
+        let text: Request = serde_json::from_str(
+            r#"{"op":"send_configured_room_text","idempotency_key":"daily:text","body":"Briefing"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            text,
+            Request::SendConfiguredRoomText { idempotency_key, body }
+                if idempotency_key == "daily:text" && body == "Briefing"
+        ));
+
+        let room_override = r#"{"op":"send_configured_room_text","idempotency_key":"daily:text","body":"Briefing","room_id":"!other:example.org"}"#;
+        assert!(serde_json::from_str::<Request>(room_override).is_err());
     }
 }

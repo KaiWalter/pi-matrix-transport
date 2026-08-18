@@ -81,6 +81,11 @@ impl StateStore {
                project_slug TEXT UNIQUE,
                created_at INTEGER NOT NULL,
                updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS proactive_outbound (
+               idempotency_key TEXT PRIMARY KEY,
+               matrix_event_id TEXT NOT NULL,
+               sent_at INTEGER NOT NULL
              );",
         )?;
 
@@ -258,6 +263,30 @@ impl StateStore {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn proactive_outbound_event(&self, idempotency_key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .lock()
+            .expect("state database mutex poisoned")
+            .query_row(
+                "SELECT matrix_event_id FROM proactive_outbound WHERE idempotency_key=?1",
+                [idempotency_key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn complete_proactive(&self, idempotency_key: &str, matrix_event_id: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .expect("state database mutex poisoned")
+            .execute(
+                "INSERT OR IGNORE INTO proactive_outbound(idempotency_key, matrix_event_id, sent_at) VALUES (?1, ?2, ?3)",
+                params![idempotency_key, matrix_event_id, now_epoch()?],
+            )?;
+        Ok(())
     }
 
     pub fn complete(

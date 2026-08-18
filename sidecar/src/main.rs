@@ -838,6 +838,47 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
                 .complete(&event_id, &idempotency_key, &matrix_event_id)?;
             Ok(Response::done("sent", Some(matrix_event_id)))
         }
+        Request::SendConfiguredRoomText {
+            idempotency_key,
+            body,
+        } => {
+            validate_proactive_request(&idempotency_key, &body)?;
+            if let Some(matrix_event_id) = app.state.proactive_outbound_event(&idempotency_key)? {
+                return Ok(Response::done("duplicate", Some(matrix_event_id)));
+            }
+            let room = configured_room(app).await?;
+            let matrix_event_id = room
+                .send(rich_text_reply(&body))
+                .with_transaction_id(deterministic_transaction_id(&idempotency_key))
+                .await?
+                .event_id
+                .to_string();
+            app.state
+                .complete_proactive(&idempotency_key, &matrix_event_id)?;
+            Ok(Response::done("sent", Some(matrix_event_id)))
+        }
+        Request::SendConfiguredRoomAudio {
+            idempotency_key,
+            speech,
+        } => {
+            validate_proactive_request(&idempotency_key, &speech)?;
+            if let Some(matrix_event_id) = app.state.proactive_outbound_event(&idempotency_key)? {
+                return Ok(Response::done("duplicate", Some(matrix_event_id)));
+            }
+            let room = configured_room(app).await?;
+            let matrix_event_id = send_audio_reply(
+                app,
+                &room,
+                &speech_text(&speech),
+                deterministic_transaction_id(&idempotency_key),
+            )
+            .await?
+            .event_id
+            .to_string();
+            app.state
+                .complete_proactive(&idempotency_key, &matrix_event_id)?;
+            Ok(Response::done("sent", Some(matrix_event_id)))
+        }
         Request::ProjectRoomAdd {
             project_slug,
             display_name,
@@ -882,14 +923,32 @@ async fn room_for_source(app: &App, source: &SourceEventContext) -> Result<Room>
         .room_id
         .parse()
         .context("source event has invalid room id")?;
+    joined_encrypted_room(app, &room_id).await
+}
+
+async fn configured_room(app: &App) -> Result<Room> {
+    joined_encrypted_room(app, &app.config.room_id).await
+}
+
+async fn joined_encrypted_room(app: &App, room_id: &matrix_sdk::ruma::OwnedRoomId) -> Result<Room> {
     let room = app
         .client
-        .get_room(&room_id)
-        .context("source room unavailable")?;
+        .get_room(room_id)
+        .context("configured room unavailable")?;
     if room.state() != RoomState::Joined || !room.latest_encryption_state().await?.is_encrypted() {
-        bail!("source room is not joined and encrypted");
+        bail!("configured room is not joined and encrypted");
     }
     Ok(room)
+}
+
+fn validate_proactive_request(idempotency_key: &str, content: &str) -> Result<()> {
+    if idempotency_key.trim().is_empty()
+        || content.trim().is_empty()
+        || content.chars().count() > MAX_MESSAGE_CHARS
+    {
+        bail!("invalid proactive outbound request");
+    }
+    Ok(())
 }
 
 fn normalize_project_slug(value: &str) -> Result<String> {
