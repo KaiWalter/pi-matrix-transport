@@ -215,7 +215,8 @@ Outbound Matrix transaction IDs are deterministically derived from idempotency i
 - Routine logs contain state transitions and counters, not message bodies or bearer material.
 - Activity feedback uses fixed strings and never carries chain-of-thought, prompts, tool inputs/results, or raw errors.
 - Device verification can be enforced. Cross-signing repair is a recovery capability, not a steady-state setting.
-- Decrypted media is handled in a private per-turn temporary directory and removed after processing.
+- Decrypted audio is handled in a private per-turn temporary directory and removed after processing.
+- Accepted image bytes are durably stored only in the mode-0600 queue database while queued/claimed and are erased when the event completes; image bytes and base64 are never logged.
 
 You remain responsible for host hardening, secret provisioning, Matrix account lifecycle, backups, monitoring, and incident response.
 
@@ -223,10 +224,11 @@ You remain responsible for host hardening, secret provisioning, Matrix account l
 
 - One configured sender and one or more explicitly bound rooms per sidecar instance
 - FIFO claim semantics per sidecar; workers can scope claims by room id
-- Accepted inbound event types: plain Matrix text and Matrix audio
-- Replies, edits, reactions, threads, images, and general file attachments are not handled
-- Text and transcript limit: 16,000 characters
+- Accepted inbound event types: plain Matrix text, Matrix audio, and Matrix images
+- Replies, edits, reactions, threads, and general non-image file attachments are not handled
+- Text, caption, and transcript limit: 16,000 characters
 - Audio limit: 25 MiB and five minutes when duration metadata is available
+- Image limit: 25 MiB; JPEG, PNG, GIF, and WebP only; file signatures are validated before queueing
 - Transcription timeout: ten minutes; stdout limit: 65,536 bytes
 - TTS timeout: two minutes; generated audio limit: 25 MiB
 - The verified-device repair path depends on homeserver authentication policy

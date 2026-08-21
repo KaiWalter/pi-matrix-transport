@@ -10,8 +10,13 @@ export type MatrixAgentTransportConfig = {
   roomId?: string;
 };
 
+export type MatrixUserMessage = string | Array<
+  | { type: "text"; text: string }
+  | { type: "image"; mimeType: string; data: string }
+>;
+
 export type PreparedInbound = {
-  prompt?: string;
+  prompt?: MatrixUserMessage;
   directAnswer?: string;
   afterSend?: () => Promise<void> | void;
 };
@@ -19,7 +24,7 @@ export type PreparedInbound = {
 export type MatrixTransportDeps = {
   ipc: (request: MatrixIpcRequest) => Promise<MatrixIpcResponse>;
   isIdle: () => boolean;
-  inject: (prompt: string) => void;
+  inject: (prompt: MatrixUserMessage) => void;
   prepareInbound?: (event: MatrixInboundEvent) => Promise<PreparedInbound>;
   log: (level: "info" | "warn", message: string) => void;
 };
@@ -27,7 +32,7 @@ export type MatrixTransportDeps = {
 type ActiveTurn = {
   event: MatrixInboundEvent;
   answer?: string;
-  prompt?: string;
+  prompt?: MatrixUserMessage;
   afterSend?: () => Promise<void> | void;
   modelRetryPending?: boolean;
   modelRetryCount?: number;
@@ -104,15 +109,15 @@ export class MatrixTransportController {
       try {
         const prepared = this.deps.prepareInbound
           ? await this.deps.prepareInbound(response.event)
-          : { prompt: buildPrompt(response.event.body, response.event.kind, this.config.promptTag) };
+          : { prompt: buildInboundMessage(response.event, this.config.promptTag) };
         if (prepared.directAnswer?.trim()) {
           this.active.answer = prepared.directAnswer.trim();
           this.active.afterSend = prepared.afterSend;
           await this.flushAnswer();
           return;
         }
-        const prompt = prepared.prompt?.trim();
-        if (!prompt) throw new Error("prepared Matrix prompt is empty");
+        const prompt = prepared.prompt;
+        if (!validPreparedPrompt(prompt)) throw new Error("prepared Matrix prompt is empty");
         this.active.prompt = prompt;
         this.deps.inject(prompt);
         this.deps.log("info", `${this.config.laneLabel}: injected one Matrix turn`);
@@ -357,9 +362,23 @@ function describeError(error: unknown): string {
 
 export function buildPrompt(body: string, kind: MatrixInboundEvent["kind"] = "text", promptTag = "matrix"): string {
   const trimmedTag = promptTag.trim() || "matrix";
-  return kind === "voice"
-    ? `[${trimmedTag} voice]\n${body.trim()}`
-    : `[${trimmedTag}]\n${body.trim()}`;
+  if (kind === "voice") return `[${trimmedTag} voice]\n${body.trim()}`;
+  if (kind === "image") return `[${trimmedTag} image]\n${body.trim()}`;
+  return `[${trimmedTag}]\n${body.trim()}`;
+}
+
+export function buildInboundMessage(event: MatrixInboundEvent, promptTag = "matrix"): MatrixUserMessage {
+  if (event.kind !== "image" || !event.image) {
+    return buildPrompt(event.body, event.kind, promptTag);
+  }
+  return [
+    { type: "text", text: buildPrompt(event.body, "image", promptTag) },
+    {
+      type: "image",
+      mimeType: event.image.media_type,
+      data: event.image.data,
+    },
+  ];
 }
 
 export function extractFinalAssistantText(messages: unknown[]): string | undefined {
@@ -385,13 +404,32 @@ export function extractFinalAssistantText(messages: unknown[]): string | undefin
   return undefined;
 }
 
-function validInbound(event: MatrixInboundEvent): boolean {
-  return typeof event.event_id === "string"
+function validPreparedPrompt(prompt: MatrixUserMessage | undefined): prompt is MatrixUserMessage {
+  if (typeof prompt === "string") return prompt.trim().length > 0;
+  return Array.isArray(prompt) && prompt.length > 0;
+}
+
+export function validInbound(event: MatrixInboundEvent): boolean {
+  const common = typeof event.event_id === "string"
     && event.event_id.length > 0
     && typeof event.room_id === "string"
     && event.room_id.length > 0
     && typeof event.body === "string"
     && event.body.trim().length > 0
-    && (event.kind === "text" || event.kind === "voice")
     && [...event.body].length <= 16000;
+  if (!common) return false;
+  if (event.kind === "text" || event.kind === "voice") return event.image === undefined;
+  if (event.kind !== "image" || !event.image) return false;
+  if (!["image/jpeg", "image/png", "image/gif", "image/webp"].includes(event.image.media_type)) {
+    return false;
+  }
+  return validBoundedBase64(event.image.data);
+}
+
+function validBoundedBase64(data: unknown): boolean {
+  if (typeof data !== "string" || data.length === 0 || data.length > 34_952_536) return false;
+  if (data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return false;
+  const decoded = Buffer.from(data, "base64");
+  if (decoded.length === 0 || decoded.length > 25 * 1024 * 1024) return false;
+  return decoded.toString("base64") === data;
 }

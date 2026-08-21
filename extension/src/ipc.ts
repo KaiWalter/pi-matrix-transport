@@ -1,10 +1,16 @@
 import net from "node:net";
 
+export type MatrixInboundImage = {
+  media_type: "image/jpeg" | "image/png" | "image/gif" | "image/webp";
+  data: string;
+};
+
 export type MatrixInboundEvent = {
   event_id: string;
   room_id: string;
   body: string;
-  kind: "text" | "voice";
+  kind: "text" | "voice" | "image";
+  image?: MatrixInboundImage;
 };
 
 export type MatrixProjectRoomBinding = {
@@ -34,6 +40,8 @@ export type MatrixIpcRequest =
   | { op: "project_room_remove"; project_slug: string }
   | { op: "project_room_list" };
 
+const MAX_IPC_RESPONSE_CHARS = 36 * 1024 * 1024;
+
 export async function request(
   socketPath: string,
   payload: MatrixIpcRequest,
@@ -58,7 +66,7 @@ export async function request(
     socket.on("connect", () => socket.end(`${JSON.stringify(payload)}\n`));
     socket.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 65536) finish(new Error("Matrix sidecar IPC response too large"));
+      if (data.length > MAX_IPC_RESPONSE_CHARS) finish(new Error("Matrix sidecar IPC response too large"));
     });
     socket.on("end", () => {
       try {

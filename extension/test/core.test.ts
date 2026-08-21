@@ -3,9 +3,11 @@ import test from "node:test";
 
 import {
   MatrixTransportController,
+  buildInboundMessage,
   buildPrompt,
   extractFinalAssistantText,
   loadConfig,
+  validInbound,
   type MatrixAgentTransportConfig,
 } from "../src/core.ts";
 import type { MatrixIpcRequest, MatrixIpcResponse } from "../src/ipc.ts";
@@ -35,6 +37,63 @@ test("activation is exact and default off", () => {
 test("prompt identifies text and voice with a configurable tag", () => {
   assert.equal(buildPrompt(" hello ", "text", "matrix agent"), "[matrix agent]\nhello");
   assert.equal(buildPrompt(" spoken ", "voice", "matrix agent"), "[matrix agent voice]\nspoken");
+});
+
+test("builds a native Pi image message", () => {
+  assert.deepEqual(
+    buildInboundMessage({
+      event_id: "$image",
+      room_id: "!room:test",
+      body: "inspect this",
+      kind: "image",
+      image: { media_type: "image/png", data: "iVBORw0KGgo=" },
+    }, "matrix agent"),
+    [
+      { type: "text", text: "[matrix agent image]\ninspect this" },
+      { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+    ],
+  );
+});
+
+test("injects a valid claimed image as multimodal content", async () => {
+  let injected: unknown;
+  const controller = new MatrixTransportController(CONFIG, {
+    ipc: async (request): Promise<MatrixIpcResponse> => {
+      if (request.op === "claim") return {
+        ok: true,
+        event: {
+          event_id: "$image",
+          room_id: "!room:test",
+          body: "inspect this",
+          kind: "image",
+          image: { media_type: "image/png", data: "iVBORw0KGgo=" },
+        },
+      };
+      if (request.op === "activity_start") return { ok: true, matrix_event_id: "$activity" };
+      return { ok: true };
+    },
+    isIdle: () => true,
+    inject: (content) => { injected = content; },
+    log: () => {},
+  });
+
+  await controller.tick();
+  assert.deepEqual(injected, [
+    { type: "text", text: "[matrix test image]\ninspect this" },
+    { type: "image", mimeType: "image/png", data: "iVBORw0KGgo=" },
+  ]);
+});
+
+test("rejects malformed or unsupported image envelopes", () => {
+  const base = {
+    event_id: "$image",
+    room_id: "!room:test",
+    body: "inspect",
+    kind: "image" as const,
+  };
+  assert.equal(validInbound({ ...base, image: { media_type: "image/png", data: "%%%%" } }), false);
+  assert.equal(validInbound({ ...base, image: { media_type: "image/svg+xml" as "image/png", data: "aGVsbG8=" } }), false);
+  assert.equal(validInbound({ ...base, image: { media_type: "image/png", data: "aGVsbG8=" } }), true);
 });
 
 test("extracts the last assistant text parts", () => {

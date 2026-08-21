@@ -6,8 +6,15 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InboundImage {
+    pub media_type: String,
+    pub data: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct InboundEvent {
@@ -15,6 +22,8 @@ pub struct InboundEvent {
     pub room_id: String,
     pub body: String,
     pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<InboundImage>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -119,6 +128,36 @@ impl StateStore {
             [default_room_id],
         )?;
 
+        let inbound_sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbound'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !inbound_sql.contains("'image'") {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE inbound RENAME TO inbound_before_images;
+                 CREATE TABLE inbound (
+                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                   event_id TEXT NOT NULL UNIQUE,
+                   body TEXT NOT NULL,
+                   state TEXT NOT NULL CHECK(state IN ('queued','claimed','completed')),
+                   received_at INTEGER NOT NULL,
+                   claimed_at INTEGER,
+                   outbound_event_id TEXT,
+                   kind TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text','voice','image')),
+                   room_id TEXT NOT NULL DEFAULT '',
+                   image_mime TEXT,
+                   image_data BLOB
+                 );
+                 INSERT INTO inbound(sequence, event_id, body, state, received_at, claimed_at, outbound_event_id, kind, room_id)
+                   SELECT sequence, event_id, body, state, received_at, claimed_at, outbound_event_id, kind, room_id
+                   FROM inbound_before_images;
+                 DROP TABLE inbound_before_images;
+                 COMMIT;",
+            )?;
+        }
+
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -131,12 +170,49 @@ impl StateStore {
     }
 
     pub fn enqueue(&self, event_id: &str, room_id: &str, body: &str, kind: &str) -> Result<bool> {
+        if !matches!(kind, "text" | "voice") {
+            bail!("non-image event kind must be text or voice");
+        }
+        self.enqueue_inner(event_id, room_id, body, kind, None, None)
+    }
+
+    pub fn enqueue_image(
+        &self,
+        event_id: &str,
+        room_id: &str,
+        body: &str,
+        media_type: &str,
+        data: &[u8],
+    ) -> Result<bool> {
+        if data.is_empty() || media_type.is_empty() {
+            bail!("image media type and data must be non-empty");
+        }
+        self.enqueue_inner(
+            event_id,
+            room_id,
+            body,
+            "image",
+            Some(media_type),
+            Some(data),
+        )
+    }
+
+    fn enqueue_inner(
+        &self,
+        event_id: &str,
+        room_id: &str,
+        body: &str,
+        kind: &str,
+        image_mime: Option<&str>,
+        image_data: Option<&[u8]>,
+    ) -> Result<bool> {
         if event_id.is_empty()
             || room_id.is_empty()
             || body.trim().is_empty()
-            || !matches!(kind, "text" | "voice")
+            || !matches!(kind, "text" | "voice" | "image")
+            || (kind == "image") != (image_mime.is_some() && image_data.is_some())
         {
-            bail!("event id, room id, body, and kind must be valid");
+            bail!("event id, room id, body, kind, and image fields must be valid");
         }
         if !self.room_enabled(room_id)? {
             return Ok(false);
@@ -146,8 +222,8 @@ impl StateStore {
             .lock()
             .expect("state database mutex poisoned")
             .execute(
-                "INSERT OR IGNORE INTO inbound(event_id, room_id, body, kind, state, received_at) VALUES (?1, ?2, ?3, ?4, 'queued', ?5)",
-                params![event_id, room_id, body, kind, now_epoch()?],
+                "INSERT OR IGNORE INTO inbound(event_id, room_id, body, kind, image_mime, image_data, state, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+                params![event_id, room_id, body, kind, image_mime, image_data, now_epoch()?],
             )?;
         Ok(changed == 1)
     }
@@ -169,31 +245,17 @@ impl StateStore {
         let event = if let Some(room_id) = room_id {
             transaction
                 .query_row(
-                    "SELECT event_id, room_id, body, kind FROM inbound WHERE state='queued' AND room_id=?1 ORDER BY sequence LIMIT 1",
+                    "SELECT event_id, room_id, body, kind, image_mime, image_data FROM inbound WHERE state='queued' AND room_id=?1 ORDER BY sequence LIMIT 1",
                     [room_id],
-                    |row| {
-                        Ok(InboundEvent {
-                            event_id: row.get(0)?,
-                            room_id: row.get(1)?,
-                            body: row.get(2)?,
-                            kind: row.get(3)?,
-                        })
-                    },
+                    inbound_event_from_row,
                 )
                 .optional()?
         } else {
             transaction
                 .query_row(
-                    "SELECT event_id, room_id, body, kind FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
+                    "SELECT event_id, room_id, body, kind, image_mime, image_data FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
                     [],
-                    |row| {
-                        Ok(InboundEvent {
-                            event_id: row.get(0)?,
-                            room_id: row.get(1)?,
-                            body: row.get(2)?,
-                            kind: row.get(3)?,
-                        })
-                    },
+                    inbound_event_from_row,
                 )
                 .optional()?
         };
@@ -305,7 +367,7 @@ impl StateStore {
             params![idempotency_key, source_event_id, matrix_event_id, now_epoch()?],
         )?;
         let changed = transaction.execute(
-            "UPDATE inbound SET state='completed', claimed_at=NULL, outbound_event_id=?2 WHERE event_id=?1 AND state IN ('claimed','completed')",
+            "UPDATE inbound SET state='completed', claimed_at=NULL, outbound_event_id=?2, image_mime=NULL, image_data=NULL WHERE event_id=?1 AND state IN ('claimed','completed')",
             params![source_event_id, matrix_event_id],
         )?;
         if changed != 1 {
@@ -416,6 +478,25 @@ impl StateStore {
     }
 }
 
+fn inbound_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboundEvent> {
+    let media_type = row.get::<_, Option<String>>(4)?;
+    let image_data = row.get::<_, Option<Vec<u8>>>(5)?;
+    let image = match (media_type, image_data) {
+        (Some(media_type), Some(data)) => Some(InboundImage {
+            media_type,
+            data: BASE64.encode(data),
+        }),
+        _ => None,
+    };
+    Ok(InboundEvent {
+        event_id: row.get(0)?,
+        room_id: row.get(1)?,
+        body: row.get(2)?,
+        kind: row.get(3)?,
+        image,
+    })
+}
+
 fn now_epoch() -> Result<i64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
@@ -423,6 +504,8 @@ fn now_epoch() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+    use rusqlite::Connection;
 
     use super::StateStore;
 
@@ -474,10 +557,100 @@ mod tests {
         let first = store.claim(None).unwrap().unwrap();
         assert_eq!(first.event_id, "$z-first");
         assert_eq!(first.kind, "text");
+        assert_eq!(first.image, None);
         let second = store.claim(None).unwrap().unwrap();
         assert_eq!(second.event_id, "$a-second");
         assert_eq!(second.kind, "voice");
         assert!(store.claim(None).unwrap().is_none());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn migrates_existing_text_voice_queue_before_accepting_images() {
+        let path = temporary_db("image-migration");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE inbound (
+                   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                   event_id TEXT NOT NULL UNIQUE,
+                   body TEXT NOT NULL,
+                   state TEXT NOT NULL CHECK(state IN ('queued','claimed','completed')),
+                   received_at INTEGER NOT NULL,
+                   claimed_at INTEGER,
+                   outbound_event_id TEXT,
+                   kind TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text','voice')),
+                   room_id TEXT NOT NULL DEFAULT ''
+                 );
+                 INSERT INTO inbound(event_id, body, state, received_at, kind, room_id)
+                   VALUES ('$legacy', 'legacy voice', 'queued', 1, 'voice', '!default:example.org');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open(
+            &path,
+            "!default:example.org",
+            &["!default:example.org".to_owned()],
+        )
+        .unwrap();
+        let legacy = store.claim(None).unwrap().unwrap();
+        assert_eq!(legacy.event_id, "$legacy");
+        assert_eq!(legacy.kind, "voice");
+        assert!(store.release("$legacy").unwrap());
+        assert!(store
+            .enqueue_image(
+                "$image",
+                "!default:example.org",
+                "diagram.png",
+                "image/png",
+                b"png-bytes",
+            )
+            .unwrap());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn persists_and_claims_image_bytes_as_base64() {
+        let path = temporary_db("image");
+        cleanup(&path);
+        let store = StateStore::open(
+            &path,
+            "!default:example.org",
+            &["!default:example.org".to_owned()],
+        )
+        .unwrap();
+        assert!(store
+            .enqueue_image(
+                "$image",
+                "!default:example.org",
+                "diagram.png",
+                "image/png",
+                b"png-bytes",
+            )
+            .unwrap());
+        let event = store.claim(None).unwrap().unwrap();
+        assert_eq!(event.kind, "image");
+        let image = event.image.unwrap();
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data, "cG5nLWJ5dGVz");
+        store.complete("$image", "reply:$image", "$out").unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let retained_bytes: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT image_data FROM inbound WHERE event_id='$image'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_bytes, None);
         cleanup(&path);
     }
 

@@ -25,8 +25,9 @@ use matrix_sdk::{
     room::edit::EditedContent,
     ruma::{
         events::room::message::{
-            AudioMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-            RoomMessageEventContent, RoomMessageEventContentWithoutRelation,
+            AudioMessageEventContent, ImageMessageEventContent, MessageType,
+            OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            RoomMessageEventContentWithoutRelation,
         },
         OwnedEventId, OwnedTransactionId,
     },
@@ -45,6 +46,7 @@ use tokio::{
 const MAX_REQUEST_BYTES: u64 = 65_536;
 const MAX_MESSAGE_CHARS: usize = 16_000;
 const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_AUDIO_DURATION: Duration = Duration::from_secs(5 * 60);
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TTS_TIMEOUT: Duration = Duration::from_secs(2 * 60);
@@ -483,6 +485,20 @@ async fn accept_inbound(
             };
             app.state.enqueue(&event_id, &room_id, &transcript, "voice")
         }
+        MessageType::Image(image) => match download_image(&app, image).await {
+            Ok(Some((body, media_type, bytes))) => {
+                app.state
+                    .enqueue_image(&event_id, &room_id, &body, &media_type, &bytes)
+            }
+            Ok(None) => {
+                tracing::warn!("rejected one unsupported Matrix image event");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("failed to process one Matrix image event");
+                return;
+            }
+        },
         _ => return,
     };
     match accepted {
@@ -518,6 +534,89 @@ fn private_temp_directory(root: &Path) -> Result<tempfile::TempDir> {
         .tempdir_in(root)?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
     Ok(directory)
+}
+
+async fn download_image(
+    app: &App,
+    image: ImageMessageEventContent,
+) -> Result<Option<(String, String, Vec<u8>)>> {
+    let declared_media_type = image.info.as_ref().and_then(|info| {
+        info.mimetype
+            .as_deref()
+            .and_then(normalize_image_media_type)
+    });
+    if image
+        .info
+        .as_ref()
+        .and_then(|info| info.size)
+        .is_some_and(|size| u64::from(size) > MAX_IMAGE_BYTES as u64)
+        || image
+            .info
+            .as_ref()
+            .and_then(|info| info.mimetype.as_deref())
+            .is_some_and(|value| normalize_image_media_type(value).is_none())
+    {
+        return Ok(None);
+    }
+
+    let body = image
+        .caption()
+        .map(str::trim)
+        .filter(|caption| !caption.is_empty())
+        .unwrap_or("Please analyze the attached Matrix image.")
+        .to_owned();
+    if body.chars().count() > MAX_MESSAGE_CHARS {
+        return Ok(None);
+    }
+    let request = MediaRequestParameters {
+        source: image.source,
+        format: MediaFormat::File,
+    };
+    let bytes = app
+        .client
+        .media()
+        .get_media_content(&request, false)
+        .await?;
+    if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+        return Ok(None);
+    }
+    let Some(detected_media_type) = detect_image_media_type(&bytes) else {
+        return Ok(None);
+    };
+    if declared_media_type.is_some_and(|declared| declared != detected_media_type) {
+        return Ok(None);
+    }
+    Ok(Some((body, detected_media_type.to_owned(), bytes)))
+}
+
+fn normalize_image_media_type(value: &str) -> Option<&'static str> {
+    match value
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/png" => Some("image/png"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 async fn transcribe_audio(app: &App, audio: AudioMessageEventContent) -> Result<Option<String>> {
@@ -1015,9 +1114,33 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 #[cfg(test)]
 mod tests {
     use super::{
-        deterministic_transaction_id, outbound_audio_filename, rich_text_reply, speech_text,
-        spoken_overview,
+        detect_image_media_type, deterministic_transaction_id, normalize_image_media_type,
+        outbound_audio_filename, rich_text_reply, speech_text, spoken_overview,
     };
+
+    #[test]
+    fn image_media_validation_is_exact_and_magic_based() {
+        assert_eq!(normalize_image_media_type("image/JPEG"), Some("image/jpeg"));
+        assert_eq!(
+            normalize_image_media_type("image/png; charset=binary"),
+            Some("image/png")
+        );
+        assert_eq!(normalize_image_media_type("image/svg+xml"), None);
+        assert_eq!(
+            detect_image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(
+            detect_image_media_type(b"\xff\xd8\xffrest"),
+            Some("image/jpeg")
+        );
+        assert_eq!(detect_image_media_type(b"GIF89arest"), Some("image/gif"));
+        assert_eq!(
+            detect_image_media_type(b"RIFF1234WEBPrest"),
+            Some("image/webp")
+        );
+        assert_eq!(detect_image_media_type(b"<svg/>"), None);
+    }
 
     #[test]
     fn outbound_audio_filenames_are_punctuation_free_and_unique() {
