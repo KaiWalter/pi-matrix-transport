@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> **AI-generated repository notice**
+> This repository contains substantial AI-generated code, scaffolding, and/or documentation, curated and reviewed by Kai Walter.
+>
+> Setup and environment context: [My Agent Journey: Building AI as an Operating Layer](https://dev.to/kaiwalter/my-agent-journey-building-ai-as-an-operating-layer-23ke).
+
 > Disclaimer: This repository is AI-generated and may contain errors. Review and validate all changes before production use.
 
 # pi-matrix-transport
