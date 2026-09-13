@@ -18,7 +18,7 @@ use chrono::Utc;
 use config::Config;
 use matrix_sdk::ruma::api::client::room::create_room;
 use matrix_sdk::{
-    attachment::AttachmentConfig,
+    attachment::{AttachmentConfig, AttachmentInfo, BaseAudioInfo},
     authentication::{matrix::MatrixSession, SessionTokens},
     config::SyncSettings,
     media::{MediaFormat, MediaRequestParameters},
@@ -34,6 +34,7 @@ use matrix_sdk::{
     Client, Room, RoomState, SessionMeta,
 };
 use protocol::{ActivityOutcome, Request, Response};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use store::{SourceEventContext, StateStore};
 use tokio::{
@@ -723,10 +724,39 @@ fn spoken_overview(body: &str) -> String {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct OutboundVoiceMetadata {
+    duration_ms: u64,
+    waveform: Vec<f32>,
+}
+
+impl OutboundVoiceMetadata {
+    fn into_attachment_info(self) -> Result<AttachmentInfo> {
+        let duration = Duration::from_millis(self.duration_ms);
+        if duration.is_zero() || duration > MAX_AUDIO_DURATION {
+            bail!("Matrix reply voice duration is invalid");
+        }
+        if self.waveform.is_empty()
+            || self.waveform.len() > 120
+            || self
+                .waveform
+                .iter()
+                .any(|sample| !sample.is_finite() || !(0.0..=1.0).contains(sample))
+        {
+            bail!("Matrix reply voice waveform is invalid");
+        }
+        Ok(AttachmentInfo::Voice(BaseAudioInfo {
+            duration: Some(duration),
+            waveform: Some(self.waveform),
+            size: None,
+        }))
+    }
+}
+
 fn outbound_audio_filename() -> String {
     let timestamp = Utc::now().format("%Y%m%dT%H%M%S%9fZ");
     let sequence = OUTBOUND_AUDIO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("matrix-reply-{timestamp}-{sequence:08}.mp3")
+    format!("matrix-reply-{timestamp}-{sequence:08}.ogg")
 }
 
 async fn send_audio_reply(
@@ -739,10 +769,13 @@ async fn send_audio_reply(
         bail!("Matrix reply has no speakable content");
     }
     let temp_directory = private_temp_directory(&app.config.media_temp_path)?;
-    let path = temp_directory.path().join("outbound.mp3");
+    let path = temp_directory.path().join("outbound.ogg");
+    let metadata_path = temp_directory.path().join("outbound.json");
     let mut child = Command::new(&app.config.tts_command)
         .args(["--stdin", "--out"])
         .arg(&path)
+        .arg("--metadata-out")
+        .arg(&metadata_path)
         .args(["--voice", &app.config.tts_voice])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -765,13 +798,19 @@ async fn send_audio_reply(
     if data.is_empty() || data.len() > MAX_AUDIO_BYTES {
         bail!("Matrix reply audio size is invalid");
     }
-    let content_type: mime::Mime = "audio/mpeg".parse()?;
+    let metadata: OutboundVoiceMetadata =
+        serde_json::from_slice(&tokio::fs::read(&metadata_path).await?)
+            .context("Matrix reply voice metadata is invalid")?;
+    let attachment_info = metadata.into_attachment_info()?;
+    let content_type: mime::Mime = "audio/ogg".parse()?;
     Ok(room
         .send_attachment(
             outbound_audio_filename(),
             &content_type,
             data,
-            AttachmentConfig::new().txn_id(transaction_id),
+            AttachmentConfig::new()
+                .txn_id(transaction_id)
+                .info(attachment_info),
         )
         .await?)
 }
@@ -1116,7 +1155,9 @@ mod tests {
     use super::{
         detect_image_media_type, deterministic_transaction_id, normalize_image_media_type,
         outbound_audio_filename, rich_text_reply, speech_text, spoken_overview,
+        OutboundVoiceMetadata,
     };
+    use matrix_sdk::attachment::AttachmentInfo;
 
     #[test]
     fn image_media_validation_is_exact_and_magic_based() {
@@ -1149,7 +1190,7 @@ mod tests {
 
         assert_ne!(first, second);
         assert!(first.starts_with("matrix-reply-"));
-        assert!(first.ends_with(".mp3"));
+        assert!(first.ends_with(".ogg"));
         let timestamp = first
             .strip_prefix("matrix-reply-")
             .and_then(|value| value.split_once('-'))
@@ -1161,6 +1202,36 @@ mod tests {
         assert!(timestamp[..24]
             .chars()
             .all(|character| character.is_ascii_digit() || character == 'T'));
+    }
+
+    #[test]
+    fn outbound_voice_metadata_requires_bounded_duration_and_waveform() {
+        let info = OutboundVoiceMetadata {
+            duration_ms: 1_500,
+            waveform: vec![0.0, 0.5, 1.0],
+        }
+        .into_attachment_info()
+        .expect("valid voice metadata");
+        assert!(matches!(info, AttachmentInfo::Voice(_)));
+
+        assert!(OutboundVoiceMetadata {
+            duration_ms: 0,
+            waveform: vec![0.5],
+        }
+        .into_attachment_info()
+        .is_err());
+        assert!(OutboundVoiceMetadata {
+            duration_ms: 1_500,
+            waveform: vec![1.1],
+        }
+        .into_attachment_info()
+        .is_err());
+        assert!(OutboundVoiceMetadata {
+            duration_ms: 1_500,
+            waveform: Vec::new(),
+        }
+        .into_attachment_info()
+        .is_err());
     }
 
     #[test]
