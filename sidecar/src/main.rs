@@ -51,6 +51,9 @@ const MAX_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_AUDIO_DURATION: Duration = Duration::from_secs(5 * 60);
 const TRANSCRIBE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TTS_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+// Keep each attachment comfortably within the five-minute Matrix voice-message
+// validation limit while preserving every word across sequential attachments.
+const MAX_SPEECH_SEGMENT_CHARS: usize = 2_400;
 const MAX_TRANSCRIPT_BYTES: u64 = 65_536;
 const VOICE_PROCESSING_ERROR_MESSAGE: &str =
     "I could not transcribe this Matrix voice message. Please resend it.";
@@ -694,34 +697,56 @@ async fn transcribe_audio(app: &App, audio: AudioMessageEventContent) -> Result<
     Ok(Some(transcript))
 }
 
-fn spoken_overview(body: &str) -> String {
+fn speech_segments(body: &str) -> Vec<String> {
     let speech = speech_text(body);
-    if speech.is_empty() {
-        return String::new();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+
+    // Prefer paragraph and sentence boundaries. Long sentences fall back to
+    // word boundaries, so content is never silently discarded.
+    for paragraph in speech.split('\n') {
+        for sentence in paragraph.split_inclusive(['.', '!', '?']) {
+            let sentence = sentence.trim();
+            if sentence.is_empty() {
+                continue;
+            }
+            append_speech_unit(&mut segments, &mut current, sentence);
+        }
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+fn append_speech_unit(segments: &mut Vec<String>, current: &mut String, unit: &str) {
+    if unit.chars().count() > MAX_SPEECH_SEGMENT_CHARS {
+        let words = unit.split_whitespace().collect::<Vec<_>>();
+        if words.len() == 1 {
+            if !current.is_empty() {
+                segments.push(std::mem::take(current));
+            }
+            // An unbroken token cannot be split without corrupting it. Keep it
+            // intact so that the full text event remains faithfully represented.
+            segments.push(unit.to_owned());
+            return;
+        }
+        for word in words {
+            append_speech_unit(segments, current, word);
+        }
+        return;
     }
 
-    const MAX_OVERVIEW_CHARS: usize = 420;
-    let mut overview = String::new();
-    for word in speech.split_whitespace() {
-        let needed = if overview.is_empty() {
-            word.len()
-        } else {
-            word.len() + 1
-        };
-        if overview.chars().count() + needed > MAX_OVERVIEW_CHARS {
-            break;
-        }
-        if !overview.is_empty() {
-            overview.push(' ');
-        }
-        overview.push_str(word);
+    let separator = usize::from(!current.is_empty());
+    if current.chars().count() + separator + unit.chars().count() > MAX_SPEECH_SEGMENT_CHARS
+        && !current.is_empty()
+    {
+        segments.push(std::mem::take(current));
     }
-
-    if overview.is_empty() {
-        speech
-    } else {
-        overview
+    if !current.is_empty() {
+        current.push(' ');
     }
+    current.push_str(unit);
 }
 
 #[derive(Debug, Deserialize)]
@@ -948,23 +973,23 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
                         "{idempotency_key}:text"
                     )))
                     .await?;
-                let speech = spoken_overview(body.trim());
-                match send_audio_reply(
-                    app,
-                    &room,
-                    &speech,
-                    deterministic_transaction_id(&format!("{idempotency_key}:audio")),
-                )
-                .await
-                {
-                    Ok(_audio_sent) => text_sent.event_id.to_string(),
-                    Err(_) => {
+                for (index, speech) in speech_segments(body.trim()).iter().enumerate() {
+                    if send_audio_reply(
+                        app,
+                        &room,
+                        speech,
+                        deterministic_transaction_id(&format!("{idempotency_key}:audio:{index}")),
+                    )
+                    .await
+                    .is_err()
+                    {
                         tracing::warn!(
-                            "audio overview reply failed; retained encrypted text detail reply"
+                            segment = index + 1,
+                            "audio reply segment failed; retained encrypted text reply"
                         );
-                        text_sent.event_id.to_string()
                     }
                 }
+                text_sent.event_id.to_string()
             } else {
                 room.send(rich_text_reply(&body))
                     .with_transaction_id(deterministic_transaction_id(&idempotency_key))
@@ -1154,8 +1179,8 @@ fn deterministic_transaction_id(idempotency_key: &str) -> OwnedTransactionId {
 mod tests {
     use super::{
         detect_image_media_type, deterministic_transaction_id, normalize_image_media_type,
-        outbound_audio_filename, rich_text_reply, speech_text, spoken_overview,
-        OutboundVoiceMetadata,
+        outbound_audio_filename, rich_text_reply, speech_segments, speech_text,
+        OutboundVoiceMetadata, MAX_SPEECH_SEGMENT_CHARS,
     };
     use matrix_sdk::attachment::AttachmentInfo;
 
@@ -1260,11 +1285,24 @@ mod tests {
     }
 
     #[test]
-    fn spoken_overview_is_bounded_and_non_empty_for_text() {
-        let source = "Status update with several details that should be shortened for spoken output while keeping the key meaning available for quick listening.";
-        let overview = spoken_overview(source);
-        assert!(!overview.is_empty());
-        assert!(overview.chars().count() <= 420);
+    fn speech_segments_preserve_content_beyond_the_former_overview_limit() {
+        let source = format!("{} final sentence.", "detail ".repeat(800));
+        let expected = speech_text(&source)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let segments = speech_segments(&source);
+        let actual = segments
+            .iter()
+            .flat_map(|segment| segment.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(segments.len() > 1);
+        assert_eq!(actual, expected);
+        assert!(segments
+            .iter()
+            .all(|segment| segment.chars().count() <= MAX_SPEECH_SEGMENT_CHARS));
     }
 
     #[test]

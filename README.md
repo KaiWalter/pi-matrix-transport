@@ -10,7 +10,7 @@
 
 `pi-matrix-transport` connects a [Pi coding agent](https://github.com/badlogic/pi-mono) to one or more end-to-end encrypted Matrix rooms.
 
-It is intended for a small, tightly controlled deployment: one Matrix account/device owner sidecar, one allowed sender, explicit room bindings, and FIFO conversation handling. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text. For an audio-origin turn, the sidecar sends encrypted text detail plus an encrypted MSC3245-compatible Ogg/Opus voice-message overview.
+It is intended for a small, tightly controlled deployment: one Matrix account/device owner sidecar, one allowed sender, explicit room bindings, and FIFO conversation handling. Incoming Matrix text or audio is delivered to Pi; Pi's final answer is returned as encrypted Matrix text. For an audio-origin turn, the sidecar sends the full encrypted text detail first, then one or more ordered encrypted MSC3245-compatible Ogg/Opus voice-message segments containing the complete speech-safe reply.
 
 The transport is **default-off** and fails closed unless both components are explicitly enabled.
 
@@ -22,7 +22,7 @@ The transport is **default-off** and fails closed unless both components are exp
 - A mode-`0600` Unix-socket API between Matrix and Pi; no TCP listener
 - Text input and bounded encrypted audio input with an external transcription command
 - Markdown-aware encrypted text replies
-- Audio-origin replies deliver encrypted text detail plus an MSC3245-compatible encrypted Ogg/Opus voice message through an external text-to-speech command (text-only if synthesis fails)
+- Audio-origin replies deliver encrypted text detail first, then one or more ordered MSC3245-compatible encrypted Ogg/Opus voice-message segments through an external text-to-speech command; text remains delivered if a segment fails
 - Typing notifications and one sanitized progress notice (`Processing…`, `Still working…`, `Done.` or `Stopped.`)
 - Optional enforcement that the configured Matrix device is cross-signed and verified
 
