@@ -11,7 +11,15 @@ export default function matrixTransportAgent(pi: ExtensionAPI): void {
   let timer: NodeJS.Timeout | undefined;
   let generation = 0;
   const controller = new MatrixTransportController(config, {
-    ipc: (payload) => request(config.socketPath, payload),
+    // A voice-origin send waits for synthesis and encrypted upload after its
+    // text event. The former five-second default destroyed the local socket
+    // early, producing false sidecar IPC failures and leaving delivery retries
+    // behind. Lightweight claim/activity calls remain tightly bounded.
+    ipc: (payload) => request(
+      config.socketPath,
+      payload,
+      payload.op === "send" ? 20 * 60 * 1000 : 30 * 1000,
+    ),
     isIdle: () => currentContext?.isIdle() === true,
     inject: (prompt) => pi.sendUserMessage(prompt),
     log: (level, message) => console[level](`[pi-matrix-transport] ${message}`),
