@@ -10,6 +10,7 @@ export type MatrixInboundEvent = {
   room_id: string;
   body: string;
   kind: "text" | "voice" | "image";
+  reply_to?: string;
   image?: MatrixInboundImage;
 };
 

@@ -26,7 +26,7 @@ use matrix_sdk::{
     ruma::{
         events::room::message::{
             AudioMessageEventContent, ImageMessageEventContent, MessageType,
-            OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+            OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
             RoomMessageEventContentWithoutRelation,
         },
         OwnedEventId, OwnedTransactionId,
@@ -437,10 +437,19 @@ async fn accept_inbound(
     if room.state() != RoomState::Joined
         || event.sender != app.config.sender_id
         || event.sender == client.user_id().expect("restored session has user id")
-        || event.content.relates_to.is_some()
     {
         return;
     }
+    // Plain messages, replies and thread replies are accepted; edits and other relations stay ignored.
+    let reply_to: Option<String> = match &event.content.relates_to {
+        None => None,
+        Some(Relation::Reply { in_reply_to }) => Some(in_reply_to.event_id.to_string()),
+        Some(Relation::Thread(thread)) => Some(match (&thread.in_reply_to, thread.is_falling_back) {
+            (Some(reply), false) => reply.event_id.to_string(),
+            _ => thread.event_id.to_string(),
+        }),
+        Some(_) => return,
+    };
     match room.latest_encryption_state().await {
         Ok(state) if state.is_encrypted() => {}
         _ => return,
@@ -469,11 +478,13 @@ async fn accept_inbound(
     }
     let accepted = match event.content.msgtype {
         MessageType::Text(text) => {
-            let body = text.body.trim();
+            let stripped = strip_reply_fallback(&text.body, reply_to.is_some());
+            let body = stripped.trim();
             if body.is_empty() || body.chars().count() > MAX_MESSAGE_CHARS {
                 return;
             }
-            app.state.enqueue(&event_id, &room_id, body, "text")
+            app.state
+                .enqueue_reply(&event_id, &room_id, body, "text", reply_to.as_deref())
         }
         MessageType::Audio(audio) => {
             let transcript = match transcribe_audio(&app, audio).await {
@@ -487,8 +498,10 @@ async fn accept_inbound(
                     VOICE_PROCESSING_ERROR_MESSAGE.to_owned()
                 }
             };
-            app.state.enqueue(&event_id, &room_id, &transcript, "voice")
+            app.state
+                .enqueue_reply(&event_id, &room_id, &transcript, "voice", reply_to.as_deref())
         }
+        MessageType::Image(_) if reply_to.is_some() => return,
         MessageType::Image(image) => match download_image(&app, image).await {
             Ok(Some((body, media_type, bytes))) => {
                 app.state
@@ -510,6 +523,21 @@ async fn accept_inbound(
         Ok(false) => tracing::debug!("ignored duplicate Matrix event"),
         Err(_) => tracing::error!("failed to persist Matrix event"),
     }
+}
+
+/// Legacy reply fallbacks prefix the body with `> ` quote lines followed by a blank line.
+fn strip_reply_fallback(body: &str, is_reply: bool) -> String {
+    if !is_reply || !body.starts_with("> ") {
+        return body.to_owned();
+    }
+    let mut rest = body;
+    while rest.starts_with("> ") || rest.starts_with(">\n") {
+        match rest.split_once('\n') {
+            Some((_, tail)) => rest = tail,
+            None => return String::new(),
+        }
+    }
+    rest.trim_start_matches('\n').to_owned()
 }
 
 async fn clear_private_temp_directory(path: &Path) -> Result<()> {
@@ -1319,5 +1347,18 @@ mod tests {
         assert!(formatted.contains("<h1>Status</h1>"));
         assert!(formatted.contains("<strong>ready</strong>"));
         assert!(formatted.contains("<a href=\"https://example.test\">details</a>"));
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::strip_reply_fallback;
+
+    #[test]
+    fn strips_legacy_quote_fallback_only_for_replies() {
+        let body = "> <@a:x> A6 Prepare budget\n> second line\n\nA6 due friday";
+        assert_eq!(strip_reply_fallback(body, true), "A6 due friday");
+        assert_eq!(strip_reply_fallback(body, false), body);
+        assert_eq!(strip_reply_fallback("plain", true), "plain");
     }
 }

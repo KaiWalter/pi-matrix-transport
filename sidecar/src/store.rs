@@ -24,6 +24,9 @@ pub struct InboundEvent {
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<InboundImage>,
+    /// Event id this message replies to (Matrix reply or thread root); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -158,6 +161,16 @@ impl StateStore {
             )?;
         }
 
+        let has_reply_to = connection
+            .prepare("PRAGMA table_info(inbound)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "reply_to");
+        if !has_reply_to {
+            connection.execute("ALTER TABLE inbound ADD COLUMN reply_to TEXT", [])?;
+        }
+
         let store = Self {
             connection: Mutex::new(connection),
         };
@@ -170,10 +183,21 @@ impl StateStore {
     }
 
     pub fn enqueue(&self, event_id: &str, room_id: &str, body: &str, kind: &str) -> Result<bool> {
+        self.enqueue_reply(event_id, room_id, body, kind, None)
+    }
+
+    pub fn enqueue_reply(
+        &self,
+        event_id: &str,
+        room_id: &str,
+        body: &str,
+        kind: &str,
+        reply_to: Option<&str>,
+    ) -> Result<bool> {
         if !matches!(kind, "text" | "voice") {
             bail!("non-image event kind must be text or voice");
         }
-        self.enqueue_inner(event_id, room_id, body, kind, None, None)
+        self.enqueue_inner(event_id, room_id, body, kind, None, None, reply_to)
     }
 
     pub fn enqueue_image(
@@ -194,6 +218,7 @@ impl StateStore {
             "image",
             Some(media_type),
             Some(data),
+            None,
         )
     }
 
@@ -205,6 +230,7 @@ impl StateStore {
         kind: &str,
         image_mime: Option<&str>,
         image_data: Option<&[u8]>,
+        reply_to: Option<&str>,
     ) -> Result<bool> {
         if event_id.is_empty()
             || room_id.is_empty()
@@ -222,8 +248,8 @@ impl StateStore {
             .lock()
             .expect("state database mutex poisoned")
             .execute(
-                "INSERT OR IGNORE INTO inbound(event_id, room_id, body, kind, image_mime, image_data, state, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
-                params![event_id, room_id, body, kind, image_mime, image_data, now_epoch()?],
+                "INSERT OR IGNORE INTO inbound(event_id, room_id, body, kind, image_mime, image_data, state, received_at, reply_to) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8)",
+                params![event_id, room_id, body, kind, image_mime, image_data, now_epoch()?, reply_to],
             )?;
         Ok(changed == 1)
     }
@@ -245,7 +271,7 @@ impl StateStore {
         let event = if let Some(room_id) = room_id {
             transaction
                 .query_row(
-                    "SELECT event_id, room_id, body, kind, image_mime, image_data FROM inbound WHERE state='queued' AND room_id=?1 ORDER BY sequence LIMIT 1",
+                    "SELECT event_id, room_id, body, kind, image_mime, image_data, reply_to FROM inbound WHERE state='queued' AND room_id=?1 ORDER BY sequence LIMIT 1",
                     [room_id],
                     inbound_event_from_row,
                 )
@@ -253,7 +279,7 @@ impl StateStore {
         } else {
             transaction
                 .query_row(
-                    "SELECT event_id, room_id, body, kind, image_mime, image_data FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
+                    "SELECT event_id, room_id, body, kind, image_mime, image_data, reply_to FROM inbound WHERE state='queued' ORDER BY sequence LIMIT 1",
                     [],
                     inbound_event_from_row,
                 )
@@ -494,6 +520,7 @@ fn inbound_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<InboundEv
         body: row.get(2)?,
         kind: row.get(3)?,
         image,
+        reply_to: row.get(6)?,
     })
 }
 
@@ -519,6 +546,29 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn persists_reply_target_and_leaves_plain_events_without_one() {
+        let path = temporary_db("reply-to");
+        cleanup(&path);
+        let store = StateStore::open(
+            &path,
+            "!default:example.org",
+            &["!default:example.org".to_owned()],
+        )
+        .unwrap();
+        store
+            .enqueue_reply("$reply", "!default:example.org", "A6 due friday", "text", Some("$announce"))
+            .unwrap();
+        store
+            .enqueue("$plain", "!default:example.org", "hello", "text")
+            .unwrap();
+        let first = store.claim(None).unwrap().unwrap();
+        let second = store.claim(None).unwrap().unwrap();
+        assert_eq!(first.reply_to.as_deref(), Some("$announce"));
+        assert_eq!(second.reply_to, None);
+        cleanup(&path);
     }
 
     #[test]
