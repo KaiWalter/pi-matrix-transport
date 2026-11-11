@@ -31,6 +31,15 @@ pub enum Request {
         idempotency_key: String,
         body: String,
     },
+    /// Attach an image (e.g. a private crop of the block under review) to the
+    /// room of the source event. `path` must resolve inside the sidecar's
+    /// private `outbound-images` directory; the file is uploaded through the
+    /// encrypted room only (no remote service).
+    SendImage {
+        event_id: String,
+        idempotency_key: String,
+        path: String,
+    },
     /// Local scheduled delivery. The sidecar selects its configured room;
     /// callers cannot supply a room or recipient.
     SendConfiguredRoomText {

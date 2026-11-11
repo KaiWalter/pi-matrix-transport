@@ -868,6 +868,48 @@ async fn send_audio_reply(
         .await?)
 }
 
+/// Only files under this private directory (sibling of the state DB) may be
+/// attached; callers cannot exfiltrate arbitrary paths through the IPC socket.
+fn outbound_images_dir(config: &Config) -> std::path::PathBuf {
+    config
+        .state_db
+        .parent()
+        .map(|parent| parent.join("outbound-images"))
+        .unwrap_or_else(|| std::path::PathBuf::from("outbound-images"))
+}
+
+fn outbound_image_filename(media_type: &str) -> String {
+    let extension = match media_type {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "jpg",
+    };
+    let sequence = OUTBOUND_AUDIO_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("review-block-{sequence:08}.{extension}")
+}
+
+async fn read_outbound_image(root: &Path, requested: &Path) -> Result<(Vec<u8>, &'static str)> {
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .context("outbound image directory unavailable")?;
+    let resolved = tokio::fs::canonicalize(requested)
+        .await
+        .context("outbound image unavailable")?;
+    if !resolved.starts_with(&root) {
+        bail!("outbound image outside permitted directory");
+    }
+    let metadata = tokio::fs::metadata(&resolved).await?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_IMAGE_BYTES as u64 {
+        bail!("outbound image size invalid");
+    }
+    let data = tokio::fs::read(&resolved).await?;
+    let Some(media_type) = detect_image_media_type(&data) else {
+        bail!("outbound image type unsupported");
+    };
+    Ok((data, media_type))
+}
+
 async fn serve(listener: UnixListener, app: Arc<App>) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -1025,6 +1067,36 @@ async fn process_request(app: &App, request: Request) -> Result<Response> {
                     .event_id
                     .to_string()
             };
+            app.state
+                .complete(&event_id, &idempotency_key, &matrix_event_id)?;
+            Ok(Response::done("sent", Some(matrix_event_id)))
+        }
+        Request::SendImage {
+            event_id,
+            idempotency_key,
+            path,
+        } => {
+            if idempotency_key.trim().is_empty() {
+                bail!("invalid outbound image request");
+            }
+            if let Some(matrix_event_id) = app.state.outbound_event(&idempotency_key)? {
+                return Ok(Response::done("duplicate", Some(matrix_event_id)));
+            }
+            let source = ensure_source_event(app, &event_id)?;
+            let room = room_for_source(app, &source).await?;
+            let (data, media_type) =
+                read_outbound_image(&outbound_images_dir(&app.config), Path::new(&path)).await?;
+            let content_type: mime::Mime = media_type.parse()?;
+            let matrix_event_id = room
+                .send_attachment(
+                    outbound_image_filename(media_type),
+                    &content_type,
+                    data,
+                    AttachmentConfig::new().txn_id(deterministic_transaction_id(&idempotency_key)),
+                )
+                .await?
+                .event_id
+                .to_string();
             app.state
                 .complete(&event_id, &idempotency_key, &matrix_event_id)?;
             Ok(Response::done("sent", Some(matrix_event_id)))
@@ -1211,6 +1283,25 @@ mod tests {
         OutboundVoiceMetadata, MAX_SPEECH_SEGMENT_CHARS,
     };
     use matrix_sdk::attachment::AttachmentInfo;
+
+    #[tokio::test]
+    async fn outbound_image_must_live_in_permitted_directory_and_be_an_image() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("outbound-images");
+        std::fs::create_dir(&root).unwrap();
+        let good = root.join("a.jpg");
+        std::fs::write(&good, b"\xff\xd8\xffdata").unwrap();
+        let (_, media_type) = super::read_outbound_image(&root, &good).await.unwrap();
+        assert_eq!(media_type, "image/jpeg");
+        let outside = base.path().join("b.jpg");
+        std::fs::write(&outside, b"\xff\xd8\xffdata").unwrap();
+        assert!(super::read_outbound_image(&root, &outside).await.is_err());
+        let traversal = root.join("../b.jpg");
+        assert!(super::read_outbound_image(&root, &traversal).await.is_err());
+        let text = root.join("c.jpg");
+        std::fs::write(&text, b"not an image").unwrap();
+        assert!(super::read_outbound_image(&root, &text).await.is_err());
+    }
 
     #[test]
     fn image_media_validation_is_exact_and_magic_based() {
